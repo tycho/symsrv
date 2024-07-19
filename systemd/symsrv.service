@@ -1,0 +1,39 @@
+[Unit]
+Description=Windows symbol server
+After=srv-cache-ntsymbols.mount symsrv-prepare.service
+Requires=srv-cache-ntsymbols.mount symsrv-prepare.service
+Before=nginx.service
+
+[Service]
+Restart=on-failure
+Type=exec
+User=http
+Group=http
+WorkingDirectory=/srv/cache/ntsymbols
+ExecStart=/srv/cache/ntsymbols/.venv/bin/poetry run serve
+TimeoutStopSec=10
+PrivateTmp=true
+
+# Hardening options
+ProtectSystem=strict
+ReadWritePaths=/srv/cache/ntsymbols/data
+ReadWritePaths=/srv/cache/ntsymbols/run
+ReadWritePaths=/tmp
+ReadOnlyPaths=/
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+MemoryDenyWriteExecute=true
+PrivateDevices=true
+PrivateUsers=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

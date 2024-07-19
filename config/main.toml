@@ -1,0 +1,15 @@
+[uvicorn]
+unix_socket = "/srv/cache/ntsymbols/run/symsrv.sock"
+#tcp_port = 80
+workers = 8
+
+# Local disk cache configuration
+[disk_cache]
+path = "/srv/cache/ntsymbols/data"
+size = "64GB"
+
+# Specifies the TTLs for caching requests, in seconds
+[cache_ttl]
+200 = 31536000 # 365 days
+403 = 1209600  # 14 days
+404 = 604800   # 7 days

@@ -1,0 +1,34 @@
+[tool.poetry]
+name = "symsrv"
+version = "0.1.0"
+description = "Python symbol server caching proxy"
+authors = ["Steven Noonan <steven@uplinklabs.net>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.111.1"
+uvicorn = "^0.30.1"
+diskcache = "^5.6.3"
+humanize = "^4.10.0"
+httpx = "^0.27.0"
+asyncio = "^3.4.3"
+humanfriendly = "^10.0"
+
+[tool.poetry.scripts]
+serve = "symsrv.scripts:start_uvicorn"
+
+[tool.poetry.group.dev.dependencies]
+mypy = "^1.11.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.mypy]
+install_types = true
+non_interactive = true
+show_error_codes = true
+pretty = true
+ignore_missing_imports = true
+exclude = ['.venv']

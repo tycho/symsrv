@@ -1,0 +1,39 @@
+[[upstream]]
+name = "microsoft"
+base_url = "http://msdl.microsoft.com/download/symbols"
+extensions = [".pdb", ".dll"]
+
+[[upstream]]
+name = "nuget"
+base_url = "https://symbols.nuget.org/download/symbols"
+extensions = [".pdb", ".dll"]
+
+[[upstream]]
+name = "mozilla"
+base_url = "https://symbols.mozilla.org"
+extensions = [".pdb", ".dll"]
+
+[[upstream]]
+name = "chrome"
+base_url = "https://chromium-browser-symsrv.commondatastorage.googleapis.com"
+extensions = [".pdb", ".dll"]
+
+[[upstream]]
+name = "renderdoc"
+base_url = "https://renderdoc.org/symbols"
+extensions = [".pdb", ".dll"]
+
+[[upstream]]
+name = "nvidia"
+base_url = "https://driver-symbols.nvidia.com"
+extensions = [".dll"]
+
+[[upstream]]
+name = "amd"
+base_url = "https://download.amd.com/dir/bin"
+extensions = [".dll"]
+
+[[upstream]]
+name = "intel"
+base_url = "https://software.intel.com/sites/downloads/symbols"
+extensions = [".dll"]
