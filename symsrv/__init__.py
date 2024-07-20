@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+from email.utils import formatdate
+import typing
 import tomllib
 import datetime as dt
 import os
@@ -7,6 +9,11 @@ import logging
 import asyncio
 
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
+from starlette._compat import md5_hexdigest
+from starlette.background import BackgroundTask
+from starlette.types import Scope, Receive, Send
+import anyio
 import diskcache as dc
 import httpx
 import humanfriendly
@@ -17,6 +24,8 @@ logger = logging.getLogger("uvicorn.error")
 
 TTL_SUCCESS_DEFAULT = 8 * 60 * 60 # 8 hours
 TTL_FAILURE_DEFAULT = 1 * 60 * 60 # 1 hour
+
+CHUNK_SIZE = 256 * 1024
 
 cache: dc.FanoutCache = None
 cache_ttl: dict[int, int] = {}
@@ -62,20 +71,109 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Wrap an async response in a file-like object for response-to-disk
+# serialization
+class StreamingToFileSyncAdapter:
+    chunk_size = CHUNK_SIZE
+
+    def __init__(self, response: httpx.Response):
+        self.streaming_source = response.iter_bytes(self.chunk_size)
+        self.buffer = b""
+        self.buffer_offset = 0
+
+    def read(self, num_bytes: int):
+        while len(self.buffer) - self.buffer_offset < num_bytes:
+            try:
+                chunk = next(self.streaming_source)
+                self.buffer += chunk
+            except StopIteration:
+                break
+
+        if len(self.buffer) - self.buffer_offset >= num_bytes:
+            data = self.buffer[self.buffer_offset:self.buffer_offset + num_bytes]
+            self.buffer_offset += num_bytes
+            return data
+        else:
+            data = self.buffer[self.buffer_offset:]
+            self.buffer = b""
+            self.buffer_offset = 0
+            return data
+
+# Response object with an already-open file handle
+class OpenFileResponse(Response):
+    chunk_size = CHUNK_SIZE
+
+    def __init__(
+        self,
+        file: typing.BinaryIO,
+        status_code: int = 200,
+        headers: typing.Mapping[str, str] | None = None,
+        media_type: str = "application/octet-stream",
+        background: BackgroundTask | None = None,
+    ) -> None:
+        self.file = file
+        self.background = None
+        self.status_code = status_code
+        self.media_type = media_type
+        self.init_headers(headers)
+        self.stat_result = os.fstat(self.file.fileno())
+        self.set_stat_headers(self.stat_result)
+
+    def set_stat_headers(self, stat_result: os.stat_result) -> None:
+        content_length = str(stat_result.st_size)
+        last_modified = formatdate(stat_result.st_mtime, usegmt=True)
+        etag_base = str(stat_result.st_mtime) + "-" + str(stat_result.st_size)
+        etag = f'"{md5_hexdigest(etag_base.encode(), usedforsecurity=False)}"'
+
+        self.headers.setdefault("content-length", content_length)
+        self.headers.setdefault("last-modified", last_modified)
+        self.headers.setdefault("etag", etag)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": self.status_code,
+                "headers": self.raw_headers,
+            }
+        )
+        if scope["method"].upper() == "HEAD":
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        else:
+            async with anyio.wrap_file(self.file) as file:
+                more_body = True
+                while more_body:
+                    chunk = await file.read(self.chunk_size)
+                    more_body = len(chunk) == self.chunk_size
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": chunk,
+                            "more_body": more_body,
+                        }
+                    )
+
+        if self.background is not None:
+            await self.background()
+
 async def fetch_from_upstream(client: httpx.AsyncClient, url: str) -> httpx.Response:
     response = await client.get(url)
     response.raise_for_status()  # Raises HTTPStatusError for 4xx/5xx responses
     return response
 
-async def human_ttl(ttl: int):
+def human_ttl(ttl: int):
     return humanize.naturaldelta(dt.timedelta(seconds=ttl))
 
 async def cache_response(full_url: str, cache_key: str, response: httpx.Response, default_ttl: int):
+    """
+    Stream the response payload to the cache file, then retrieve a file handle
+    to it from the cache
+    """
     ttl = cache_ttl.get(response.status_code, default_ttl)
-    ttl_human = await human_ttl(ttl)
-    cache.set(cache_key, (response.content, response.status_code), expire=ttl)  # Cache for 365 days
+    ttl_human = human_ttl(ttl)
     logger.info(f"Cache miss, storing {response.status_code} from {full_url} for {ttl_human}")
-    return response.content, response.status_code
+    cache.set(cache_key, StreamingToFileSyncAdapter(response), read=True, tag=response.status_code, expire=ttl)  # Cache for 365 days
+    return cache.get(cache_key, read=True, tag=True, expire_time=True)
 
 async def single_fetch(client: httpx.AsyncClient, cache_key: str, full_url: str, method: str):
     try:
@@ -95,7 +193,7 @@ async def single_fetch(client: httpx.AsyncClient, cache_key: str, full_url: str,
             # Cache client errors, as specified in cache_ttls, or 1 hour if not found
             return await cache_response(full_url, cache_key, exc.response, TTL_FAILURE_DEFAULT)
 
-    return None, 404
+    return None, 0, 404
 
 def get_extension(path: str):
     _, ext = os.path.splitext(path)
@@ -172,21 +270,20 @@ async def proxy(path: str, request: Request):
         base_url = base_url.rstrip('/')
         full_url = f"{base_url}{path}"
         cache_key = f"{request.method}:{full_url}"
-        cached_response, expire_time = cache.get(cache_key, expire_time=True)
-        if cached_response is not None:
-            time_left = await human_ttl(expire_time - time.time())
-            content, status_code = cached_response
+        content, expire_time, status_code = cache.get(cache_key, read=True, tag=True, expire_time=True)
+        if content is not None:
+            time_left = human_ttl(expire_time - time.time())
             logger.info(f"Cache hit for {cache_key} with status {status_code}, expires in {time_left}")
             if status_code == 200:
-                return Response(content=content, status_code=status_code, media_type="application/octet-stream")
+                return OpenFileResponse(content, status_code=status_code, media_type="application/octet-stream")
         else:
             pending.append((cache_key, full_url))
 
     # Perform parallel fetch from upstreams
     for cache_key, full_url in pending:
-        content, status_code = await single_fetch(client, cache_key, full_url, request.method)
-        if status_code == 200:
-            return Response(content=content, status_code=status_code, media_type="application/octet-stream")
+        content, expire_time, status_code = await single_fetch(client, cache_key, full_url, request.method)
+        if content is not None and status_code == 200:
+            return OpenFileResponse(content, status_code=status_code, media_type="application/octet-stream")
 
     logger.info(f"No valid content for {path}, returning 404")
 
