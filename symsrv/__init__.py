@@ -138,18 +138,29 @@ class OpenFileResponse(Response):
         if scope["method"].upper() == "HEAD":
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         else:
-            async with anyio.wrap_file(self.file) as file:
-                more_body = True
-                while more_body:
-                    chunk = await file.read(self.chunk_size)
-                    more_body = len(chunk) == self.chunk_size
-                    await send(
-                        {
-                            "type": "http.response.body",
-                            "body": chunk,
-                            "more_body": more_body,
-                        }
-                    )
+            if 'extensions' in scope and 'http.response.zerocopysend' in scope['extensions']:
+                await send(
+                    {
+                        'type': 'http.response.zerocopysend',
+                        'file': self.file.fileno(),
+                        'offset': 0,
+                        'count': self.stat_result.st_size,
+                        'more_body': False,
+                    }
+                )
+            else:
+                async with anyio.wrap_file(self.file) as file:
+                    more_body = True
+                    while more_body:
+                        chunk = await file.read(self.chunk_size)
+                        more_body = len(chunk) == self.chunk_size
+                        await send(
+                            {
+                                "type": "http.response.body",
+                                "body": chunk,
+                                "more_body": more_body,
+                            }
+                        )
 
         if self.background is not None:
             await self.background()
