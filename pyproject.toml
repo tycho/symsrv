@@ -17,6 +17,8 @@ humanfriendly = "^10.0"
 starlette = "^0.37.2"
 anyio = "^4.4.0"
 tomlkit = "^0.13.0"
+websockets = "^12.0"
+httptools = "^0.6.1"
 
 [tool.poetry.scripts]
 serve = "symsrv:main"
