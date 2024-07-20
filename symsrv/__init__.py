@@ -1,7 +1,6 @@
 from contextlib import asynccontextmanager
 from email.utils import formatdate
 import typing
-import tomllib
 import datetime as dt
 import os
 import time
@@ -13,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from starlette._compat import md5_hexdigest
 from starlette.background import BackgroundTask
 from starlette.types import Scope, Receive, Send
+from tomlkit.toml_file import TOMLFile
 import anyio
 import diskcache as dc
 import httpx
@@ -42,30 +42,27 @@ async def lifespan(app: FastAPI):
     # Load main config
     global cache
     global cache_ttl
-    with open("config/main.toml", "rb") as f:
-        main_config = tomllib.load(f)
-        for key, value in main_config['cache_ttl'].items():
-            cache_ttl[int(key)] = value
+    main_config = TOMLFile("config/main.toml").read()
+    for key, value in main_config['cache_ttl'].items():
+        cache_ttl[int(key)] = value
 
-        cache_size = humanfriendly.parse_size(main_config['disk_cache']['size'], binary=True)
-        cache_path = main_config['disk_cache']['path']
-        cache = dc.FanoutCache(cache_path, size_limit=cache_size)
+    cache_size = humanfriendly.parse_size(main_config['disk_cache']['size'], binary=True)
+    cache_path = main_config['disk_cache']['path']
+    cache = dc.FanoutCache(cache_path, size_limit=cache_size)
 
     # Load blacklist config
     global substring_blacklist
     global first_path_component_blacklist
     global suffix_blacklist
-    with open("config/blacklist.toml", "rb") as f:
-        bl_config = tomllib.load(f)
-        substring_blacklist = bl_config['substring_blacklist']['patterns']
-        first_path_component_blacklist = set(bl_config['first_path_component_blacklist']['names'])
-        suffix_blacklist = bl_config['suffix_blacklist']['suffixes']
+    bl_config = TOMLFile("config/blacklist.toml").read()
+    substring_blacklist = bl_config['substring_blacklist']['patterns']
+    first_path_component_blacklist = set(bl_config['first_path_component_blacklist']['names'])
+    suffix_blacklist = bl_config['suffix_blacklist']['suffixes']
 
     # Load upstream config
     global upstreams
-    with open("config/upstreams.toml", "rb") as f:
-        upstream_config = tomllib.load(f)
-        upstreams = upstream_config['upstream']
+    upstream_config = TOMLFile("config/upstreams.toml").read()
+    upstreams = upstream_config['upstream']
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
         yield {'client': client}
@@ -172,24 +169,25 @@ async def cache_response(full_url: str, cache_key: str, response: httpx.Response
     """
     ttl = cache_ttl.get(response.status_code, default_ttl)
     ttl_human = human_ttl(ttl)
-    logger.info(f"Cache miss, storing {response.status_code} from {full_url} for {ttl_human}")
+    logger.info("Cache miss, storing %d from %s for %s", response.status_code, full_url, ttl_human)
     cache.set(cache_key, StreamingToFileSyncAdapter(response), read=True, tag=response.status_code, expire=ttl)  # Cache for 365 days
     return cache.get(cache_key, read=True, tag=True, expire_time=True)
 
 async def single_fetch(client: httpx.AsyncClient, cache_key: str, full_url: str, method: str):
     try:
         result = await fetch_from_upstream(client, full_url)
-        if result.status_code == 200:
+        status_code =result.status_code
+        if status_code == 200:
             return await cache_response(full_url, cache_key, result, TTL_SUCCESS_DEFAULT)
         else:
-            logger.warning(f"Unrecognized response code {result.status_code}, treating as uncacheable 404")
+            logger.warning("Unrecognized response code %d, treating as uncacheable 404", status_code)
     except httpx.RequestError as exc:
-        logger.error(f"Request to {full_url} failed: {exc}")
+        logger.error("Request to %s failed: %s", full_url, exc)
     except httpx.HTTPStatusError as exc:
         status_code = exc.response.status_code
         if status_code >= 500 and status_code < 600:
             # Do not cache server errors
-            logger.error(f"Request to {full_url} failed with status {status_code}")
+            logger.error("Request to %s failed with status %d", full_url, status_code)
         elif status_code >= 400 and status_code < 500:
             # Cache client errors, as specified in cache_ttls, or 1 hour if not found
             return await cache_response(full_url, cache_key, exc.response, TTL_FAILURE_DEFAULT)
@@ -214,7 +212,7 @@ def choose_upstreams(path: str):
         ext = None
 
     if ext not in [None, ".pdb", ".dll"]:
-        logger.warning(f"Path '{path}' doesn't have a recognized file extension ({ext})")
+        logger.warning("Path '%s' doesn't have a recognized file extension (%s)", path, ext)
         ext = None
 
     target_upstreams = []
@@ -236,22 +234,23 @@ def choose_upstreams(path: str):
 def is_blacklisted_path(path: str):
     for part in substring_blacklist:
         if part in path:
-            logging.debug(f"Path '{path}' rejected, matched '{part}' in substring blacklist")
+            logger.debug("Path '%s' rejected, matched '%s' in substring blacklist", path, part)
             return True
 
     for suffix in suffix_blacklist:
         if path.endswith(suffix):
-            logging.debug(f"Path '{path}' rejected, ends with '{suffix}' in suffix blacklist")
+            logger.debug("Path '%s' rejected, ends with '%s' in suffix blacklist", path, suffix)
             return True
 
     file = path.split('/')[1]
 
     if file in first_path_component_blacklist:
-        logging.debug(f"Path '{path}' rejected, first path component '{file}' in blacklist")
+        logger.debug("Path '%s' rejected, first path component '%s' in blacklist", path, file)
         return True
 
     return False
 
+@app.head("/{path:path}")
 @app.get("/{path:path}")
 async def proxy(path: str, request: Request):
     # Ensure path begins with exactly one forward slash
@@ -260,7 +259,7 @@ async def proxy(path: str, request: Request):
     client = request.state.client
 
     if is_blacklisted_path(path):
-        logger.info(f"Requested path is blacklisted, rejecting with 404 response")
+        logger.info("Requested path is blacklisted, rejecting with 404 response")
         return Response(status_code=404)
 
     target_upstreams = choose_upstreams(path)
@@ -274,7 +273,8 @@ async def proxy(path: str, request: Request):
         content, expire_time, status_code = cache.get(cache_key, read=True, tag=True, expire_time=True)
         if content is not None:
             time_left = human_ttl(expire_time - time.time())
-            logger.info(f"Cache hit for {cache_key} with status {status_code}, expires in {time_left}")
+            logger.info("Cache hit for %s with status %d, expires in %s",
+                cache_key, status_code, time_left)
             if status_code == 200:
                 return OpenFileResponse(content, status_code=status_code, media_type="application/octet-stream")
         else:
@@ -286,14 +286,12 @@ async def proxy(path: str, request: Request):
         if content is not None and status_code == 200:
             return OpenFileResponse(content, status_code=status_code, media_type="application/octet-stream")
 
-    logger.info(f"No valid content for {path}, returning 404")
+    logger.info("No valid content for %s, returning 404", path)
 
     return Response(status_code=404)
 
 def main():
-    with open("config/main.toml", "rb") as f:
-        main_config = tomllib.load(f)
-
+    main_config = TOMLFile("config/main.toml").read()
     uvicorn.run("symsrv:app", **main_config['uvicorn'])
 
 if __name__ == "__main__":
