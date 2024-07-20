@@ -1,9 +1,14 @@
+# Args passed to uvicorn.run verbatim
 [uvicorn]
-unix_socket = "/srv/cache/ntsymbols/run/symsrv.sock"
-#tcp_port = 80
+uds = "/srv/cache/ntsymbols/run/symsrv.sock"
+#host = "0.0.0.0"
+#port = 80
 workers = 4
 proxy_headers = true
 forwarded_allow_ips = "*"
+http = "httptools"
+ws = "websockets"
+log_config = "config/log_config.yml"
 
 # Local disk cache configuration
 [disk_cache]

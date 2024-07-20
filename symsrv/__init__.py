@@ -18,6 +18,7 @@ import diskcache as dc
 import httpx
 import humanfriendly
 import humanize
+import uvicorn
 
 # Set up logging
 logger = logging.getLogger("uvicorn.error")
@@ -289,7 +290,12 @@ async def proxy(path: str, request: Request):
 
     return Response(status_code=404)
 
+def main():
+    with open("config/main.toml", "rb") as f:
+        main_config = tomllib.load(f)
+
+    uvicorn.run("symsrv:app", **main_config['uvicorn'])
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3128)
+    main()
 
