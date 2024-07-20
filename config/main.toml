@@ -2,6 +2,8 @@
 unix_socket = "/srv/cache/ntsymbols/run/symsrv.sock"
 #tcp_port = 80
 workers = 8
+proxy_headers = true
+forwarded_allow_ips = "*"
 
 # Local disk cache configuration
 [disk_cache]

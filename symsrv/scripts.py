@@ -106,6 +106,11 @@ def start_uvicorn():
     else:
         raise ValueError("Could not find an appropriate listen config in config/main.toml")
 
+    if uvicorn.get('proxy_headers', False):
+        command += ["--proxy-headers"]
+        if 'forwarded_allow_ips' in uvicorn:
+            command += [f"--forwarded-allow-ips", uvicorn['forwarded_allow_ips']]
+
     command += [
         "--workers", str(uvicorn.get('workers', 8)),
         "--log-config=config/log_config.yml",
