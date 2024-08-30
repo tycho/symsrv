@@ -25,6 +25,8 @@ serve = "symsrv:main"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.11.0"
+pylint = "^3.2.5"
+black = "^24.4.2"
 
 [build-system]
 requires = ["poetry-core"]
