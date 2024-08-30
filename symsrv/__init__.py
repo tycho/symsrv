@@ -133,9 +133,9 @@ class OpenFileResponse(Response):
         etag_base = str(stat_result.st_mtime) + "-" + str(stat_result.st_size)
         etag = f'"{md5_hexdigest(etag_base.encode(), usedforsecurity=False)}"'
 
-        self.headers.setdefault("content-length", content_length)
-        self.headers.setdefault("last-modified", last_modified)
-        self.headers.setdefault("etag", etag)
+        self.headers["content-length"] = content_length
+        self.headers["last-modified"] = last_modified
+        self.headers["etag"] = etag
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         await send(
@@ -201,8 +201,9 @@ async def cache_response(
     ttl = cache_ttl.get(response.status_code, default_ttl)
     ttl_human = human_ttl(ttl)
     logger.info(
-        "Cache miss, storing %d from %s for %s",
+        "Cache miss, storing %d length %d from %s for %s",
         response.status_code,
+        len(response.content),
         full_url,
         ttl_human,
     )
