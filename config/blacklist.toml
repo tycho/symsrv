@@ -562,6 +562,15 @@ names = [
 	"ZoomAction.pdb",
 	"ZoomActionTypeData.pdb",
 
+	# Qualcomm drivers
+	"adreno_utils.pdb",
+	"libgsluser.pdb",
+	"qcdx12arm64xum.pdb",
+	"qcegparm64x.pdb",
+	"qcgpuarm64xcompilercore.pdb",
+	"qcvkarm64xcompiler.pdb",
+	"qcvkarm64xum.pdb",
+
 	# General
 	"ffmpeg.dll.pdb",
 	"libavcodec-58.pdb",
