@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from email.utils import formatdate
 import typing
 import datetime as dt
+import hashlib
 import os
 import time
 import logging
@@ -11,7 +12,6 @@ import asyncio
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
-from starlette._compat import md5_hexdigest
 from starlette.background import BackgroundTask
 from starlette.types import Scope, Receive, Send
 from tomlkit.toml_file import TOMLFile
@@ -131,7 +131,7 @@ class OpenFileResponse(Response):
         content_length = str(stat_result.st_size)
         last_modified = formatdate(stat_result.st_mtime, usegmt=True)
         etag_base = str(stat_result.st_mtime) + "-" + str(stat_result.st_size)
-        etag = f'"{md5_hexdigest(etag_base.encode(), usedforsecurity=False)}"'
+        etag = f'"{hashlib.md5(etag_base.encode()).hexdigest()}"'
 
         self.headers["content-length"] = content_length
         self.headers["last-modified"] = last_modified
