@@ -3,10 +3,10 @@ name = "microsoft"
 base_url = "http://msdl.microsoft.com/download/symbols"
 extensions = [".pdb", ".dll"]
 
-#[[upstream]]
-#name = "nuget"
-#base_url = "https://symbols.nuget.org/download/symbols"
-#extensions = [".pdb", ".dll"]
+[[upstream]]
+name = "nuget"
+base_url = "https://symbols.nuget.org/download/symbols"
+extensions = [".snupkg"]
 
 [[upstream]]
 name = "mozilla"
