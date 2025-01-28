@@ -15,12 +15,11 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.types import Scope, Receive, Send
 from tomlkit.toml_file import TOMLFile
+import aiohttp
 import anyio
-import diskcache as dc
-import httpx
-import humanfriendly
-import humanize
 import uvicorn
+
+from .asyncdiskcache import AsyncDiskCache
 
 # Set up logging
 logger = logging.getLogger("uvicorn.error")
@@ -30,7 +29,6 @@ TTL_FAILURE_DEFAULT = 1 * 60 * 60  # 1 hour
 
 CHUNK_SIZE = 256 * 1024
 
-cache: dc.FanoutCache = None
 cache_ttl: dict[int, int] = {}
 
 upstreams = []
@@ -38,22 +36,33 @@ upstreams = []
 substring_blacklist: list[str] = []
 first_path_component_blacklist: set[str] = set()
 suffix_blacklist: list[str] = []
+ignore_access: set[typing.Dict[str, typing.Any]] = set()
 
+app = FastAPI()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+class FilteredAccessLog(logging.Filter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        filter_match = (record.args[4], record.args[2])
+        if filter_match in ignore_access:
+            return False
+        return True
+
+@app.on_event("startup")
+async def startup_event():
     # Load main config
-    global cache
     global cache_ttl
     main_config = TOMLFile("config/main.toml").read()
     for key, value in main_config["cache_ttl"].items():
         cache_ttl[int(key)] = value
-
-    cache_size = humanfriendly.parse_size(
-        main_config["disk_cache"]["size"], binary=True
-    )
     cache_path = main_config["disk_cache"]["path"]
-    cache = dc.FanoutCache(cache_path, size_limit=cache_size)
+
+    global ignore_access
+    for filter_spec in main_config["log_filters"]["ignore_access"]:
+        ignore_access.add((int(filter_spec["status"]), str(filter_spec["path"])))
+    logging.getLogger("uvicorn.access").addFilter(FilteredAccessLog())
 
     # Load blacklist config
     global substring_blacklist
@@ -71,180 +80,177 @@ async def lifespan(app: FastAPI):
     upstream_config = TOMLFile("config/upstreams.toml").read()
     upstreams = upstream_config["upstream"]
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        yield {"client": client}
+    app.state.cache = AsyncDiskCache(cache_path)
+    app.state.session = aiohttp.ClientSession()
 
 
-app = FastAPI(lifespan=lifespan)
+@app.on_event("shutdown")
+async def shutdown_event():
+    await app.state.cache.close()
+    await app.state.session.close()
 
 
-# Wrap an async response in a file-like object for response-to-disk
-# serialization
-class StreamingToFileSyncAdapter:
-    chunk_size = CHUNK_SIZE
-
-    def __init__(self, response: httpx.Response):
-        self.streaming_source = response.iter_bytes(self.chunk_size)
-        self.buffer = b""
-        self.buffer_offset = 0
-
-    def read(self, num_bytes: int):
-        while len(self.buffer) - self.buffer_offset < num_bytes:
-            try:
-                chunk = next(self.streaming_source)
-                self.buffer += chunk
-            except StopIteration:
-                break
-
-        if len(self.buffer) - self.buffer_offset >= num_bytes:
-            data = self.buffer[self.buffer_offset : self.buffer_offset + num_bytes]
-            self.buffer_offset += num_bytes
-        else:
-            data = self.buffer[self.buffer_offset :]
-            self.buffer = b""
-            self.buffer_offset = 0
-        return data
+async def chunks_to_async_gen(chunks):
+    for chunk in chunks:
+        yield chunk
 
 
-# Response object with an already-open file handle
-class OpenFileResponse(Response):
-    chunk_size = CHUNK_SIZE
-
-    def __init__(
-        self,
-        file: typing.BinaryIO,
-        status_code: int = 200,
-        headers: typing.Mapping[str, str] | None = None,
-        media_type: str = "application/octet-stream",
-        background: BackgroundTask | None = None,
-    ) -> None:
-        super().__init__()
-        self.file = file
-        self.background = None
-        self.status_code = status_code
-        self.media_type = media_type
-        self.init_headers(headers)
-        self.stat_result = os.fstat(self.file.fileno())
-        self.set_stat_headers(self.stat_result)
-
-    def set_stat_headers(self, stat_result: os.stat_result) -> None:
-        content_length = str(stat_result.st_size)
-        last_modified = formatdate(stat_result.st_mtime, usegmt=True)
-        etag_base = str(stat_result.st_mtime) + "-" + str(stat_result.st_size)
-        etag = f'"{hashlib.md5(etag_base.encode()).hexdigest()}"'
-
-        self.headers["content-length"] = content_length
-        self.headers["last-modified"] = last_modified
-        self.headers["etag"] = etag
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        await send(
-            {
-                "type": "http.response.start",
-                "status": self.status_code,
-                "headers": self.raw_headers,
-            }
-        )
-        if scope["method"].upper() == "HEAD":
-            await send({"type": "http.response.body", "body": b"", "more_body": False})
-        else:
-            if (
-                "extensions" in scope
-                and "http.response.zerocopysend" in scope["extensions"]
-            ):
-                await send(
-                    {
-                        "type": "http.response.zerocopysend",
-                        "file": self.file.fileno(),
-                        "offset": 0,
-                        "count": self.stat_result.st_size,
-                        "more_body": False,
-                    }
-                )
-            else:
-                async with anyio.wrap_file(self.file) as file:
-                    more_body = True
-                    while more_body:
-                        chunk = await file.read(self.chunk_size)
-                        more_body = len(chunk) == self.chunk_size
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": chunk,
-                                "more_body": more_body,
-                            }
-                        )
-
-        if self.background is not None:
-            await self.background()
+async def empty_async_gen():
+    yield b''
 
 
 async def fetch_from_upstream(
-    client: httpx.AsyncClient, method: str, url: str
-) -> httpx.Response:
-    response = await client.request(method, url)
-    response.raise_for_status()  # Raises HTTPStatusError for 4xx/5xx responses
-    return response
-
-
-def human_ttl(ttl: int):
-    return humanize.naturaldelta(dt.timedelta(seconds=ttl))
-
-
-async def cache_response(
-    full_url: str, cache_key: str, response: httpx.Response, default_ttl: int
-):
+    session: aiohttp.ClientSession,
+    cache: AsyncDiskCache,
+    cache_key: str,
+    full_url: str,
+    method: str
+) -> typing.AsyncIterator[typing.Tuple[bytes, int, typing.Dict[str, str]]]:
     """
-    Stream the response payload to the cache file, then retrieve a file handle
-    to it from the cache
+    Fetch from upstream and handle caching based on response status.
+    Yields tuples of (chunk, status_code).
+
+    For 200 responses, yields and caches the response chunks.
+    For 4xx responses, yields nothing but caches an empty response.
+    For other responses, yields nothing and doesn't cache.
     """
-    ttl = cache_ttl.get(response.status_code, default_ttl)
-    ttl_human = human_ttl(ttl)
-    logger.info(
-        "Cache miss, storing %d length %d from %s for %s",
-        response.status_code,
-        len(response.content),
-        full_url,
-        ttl_human,
-    )
-    cache.set(
-        cache_key,
-        StreamingToFileSyncAdapter(response),
-        read=True,
-        tag=response.status_code,
-        expire=ttl,
-    )  # Cache for 365 days
-    return cache.get(cache_key, read=True, tag=True, expire_time=True)
-
-
-async def single_fetch(
-    client: httpx.AsyncClient, cache_key: str, full_url: str, method: str
-):
     try:
-        result = await fetch_from_upstream(client, method, full_url)
-        status_code = result.status_code
-        if status_code == 200:
-            return await cache_response(
-                full_url, cache_key, result, TTL_SUCCESS_DEFAULT
-            )
-        logger.warning(
-            "Unrecognized response code %d, treating as uncacheable 404",
-            status_code,
-        )
-    except httpx.RequestError as exc:
-        logger.error("Request to %s failed: %s", full_url, exc)
-    except httpx.HTTPStatusError as exc:
-        status_code = exc.response.status_code
-        if 500 <= status_code < 600:
-            # Do not cache server errors
-            logger.error("Request to %s failed with status %d", full_url, status_code)
-        elif 400 <= status_code < 500:
-            # Cache client errors, as specified in cache_ttls, or 1 hour if not found
-            return await cache_response(
-                full_url, cache_key, exc.response, TTL_FAILURE_DEFAULT
-            )
+        async with session.request(method, full_url) as response:
+            status_code = response.status
 
-    return None, 0, 404
+            if status_code == 200:
+                # Create a list to store chunks for caching
+                chunks = []
+
+                # Get an upstream ETag if possible
+                response_headers = {}
+                etag = response.headers.get('ETag')
+
+                if etag:
+                    response_headers['ETag'] = etag
+
+                for header in ['Content-Type', 'Cache-Control', 'Last-Modified']:
+                    if value := response.headers.get(header):
+                        response_headers[header] = value
+
+                # Stream the response while collecting chunks
+                async for chunk in response.content.iter_chunks():
+                    chunk_data = chunk[0]  # aiohttp returns tuples of (data, end_of_chunk)
+                    chunks.append(chunk_data)
+                    yield chunk_data, 200, response_headers
+
+                if not etag:
+                    hasher = hashlib.md5()
+                    total_size = sum(len(chunk) for chunk in chunks)
+                    hasher.update(str(total_size).encode())
+                    hasher.update(str(int(time.time())).encode())
+                    if chunks:
+                        hasher.update(chunks[0][:1024])
+                    etag = f'"{hasher.hexdigest()}"'
+
+                # Cache the successful response
+                await cache.set_streaming(
+                    cache_key,
+                    chunks_to_async_gen(chunks),
+                    ttl=cache_ttl.get(200, TTL_SUCCESS_DEFAULT),
+                    tags={
+                        'status_code': 200,
+                        'etag': etag,
+                        'headers': response_headers
+                    }
+                )
+
+            elif 400 <= status_code < 500:
+                response_headers = {}
+                for header in ['Cache-Control']:
+                    if value := response.headers.get(header):
+                        response_headers[header] = value
+
+                # Create a list to store chunks for caching
+                # Cache client errors with empty content
+                await cache.set_streaming(
+                    cache_key,
+                    empty_async_gen(),  # Empty content
+                    ttl=cache_ttl.get(status_code, TTL_FAILURE_DEFAULT),
+                    tags={
+                        'status_code': status_code,
+                        'headers': response_headers
+                    }
+                )
+                # Don't yield anything for 4xx errors
+
+            else:
+                logger.error(
+                    "Request to %s failed with status %d",
+                    full_url,
+                    status_code
+                )
+                # Don't yield anything for other status codes
+
+    except aiohttp.ClientError as exc:
+        logger.error("Request to %s failed: %s", full_url, exc)
+        # Don't yield anything for connection errors
+
+
+async def fetch_cached_or_live(
+    session: aiohttp.ClientSession,
+    cache: AsyncDiskCache,
+    cache_key: str,
+    full_url: str,
+    method: str,
+    request_headers: typing.Optional[typing.Dict[str, str]] = None
+) -> typing.AsyncIterator[typing.Tuple[bytes, int, typing.Dict[str, str]]]:
+    """
+    Try to fetch from cache first, fall back to live request if needed.
+    Yields tuples of (chunk, status_code).
+    """
+    # Check cache first
+    if metadata := await cache.get_metadata(cache_key):
+        status_code = metadata.tags.get('status_code', None)
+        cached_headers = metadata.tags.get('headers', {})
+        response_headers = {}
+
+        # In a cached response that meets the 'If-None-Match' or
+        # 'If-Modified-Since' conditions, we provide ETag and Last-Modified.
+        if last_modified := cached_headers.get('Last-Modified'):
+            response_headers['Last-Modified'] = last_modified
+        if cached_etag := cached_headers.get('ETag'):
+            response_headers['ETag'] = cached_etag
+
+        # Check if we have an ETag match
+        if (if_none_match := request_headers.get('if-none-match')) and cached_etag:
+            if if_none_match == cached_etag:
+                # Return just headers with 304 status
+                yield b'', 304, response_headers
+                return
+
+        # Check If-Modified-Since
+        if (if_modified_since := request_headers.get('if-modified-since')) and last_modified:
+            try:
+                # Parse both dates and compare
+                req_date = time.strptime(if_modified_since, "%a, %d %b %Y %H:%M:%S GMT")
+                cache_date = time.strptime(last_modified, "%a, %d %b %Y %H:%M:%S GMT")
+                if cache_date <= req_date:
+                    yield b'', 304, cached_headers
+                    return
+            except ValueError:
+                # If we can't parse the dates, ignore the header
+                pass
+
+        if cached_stream := await cache.get_streaming(cache_key):
+            async for chunk in cached_stream:
+                yield chunk, status_code, cached_headers
+            return
+
+    # If not in cache or expired, fetch from upstream
+    async for chunk, status, headers in fetch_from_upstream(
+        session,
+        cache,
+        cache_key,
+        full_url,
+        method
+    ):
+        yield chunk, status, headers
 
 
 def get_extension(path: str):
@@ -320,51 +326,54 @@ async def proxy(path: str, request: Request):
     # Ensure path begins with exactly one forward slash
     path = "/" + path.lstrip("/")
 
-    client = request.state.client
-
     if is_blacklisted_path(path):
-        logger.info("Requested path is blacklisted, rejecting with 404 response")
+        logger.debug(f"Blacklisted: '{path}', rejecting with 404 response")
         return Response(status_code=404)
 
     target_upstreams = choose_upstreams(path)
+    session = request.app.state.session  # We'll need to change this to aiohttp.ClientSession
+    cache = request.app.state.cache      # Our AsyncDiskCache instance
 
-    # Check cache first
-    pending = []
-    for base_url in target_upstreams:
-        base_url = base_url.rstrip("/")
-        full_url = f"{base_url}{path}"
+    async def stream_from_upstream(base_url: str):
+        """Try a single upstream, return (success, stream) tuple"""
+        full_url = f"{base_url.rstrip('/')}{path}"
         cache_key = f"{request.method}:{full_url}"
-        content, expire_time, status_code = cache.get(
-            cache_key, read=True, tag=True, expire_time=True
-        )
-        if content is not None:
-            time_left = human_ttl(expire_time - time.time())
-            logger.info(
-                "Cache hit for %s with status %d, expires in %s",
-                cache_key,
-                status_code,
-                time_left,
-            )
-            if status_code == 200:
-                return OpenFileResponse(
-                    content,
-                    status_code=status_code,
-                    media_type="application/octet-stream",
-                )
-        else:
-            pending.append((cache_key, full_url))
 
-    # Perform parallel fetch from upstreams
-    for cache_key, full_url in pending:
-        content, expire_time, status_code = await single_fetch(
-            client, cache_key, full_url, request.method
+        stream = fetch_cached_or_live(
+            session,
+            cache,
+            cache_key,
+            full_url,
+            request.method,
+            dict(request.headers)
         )
-        if content is not None and status_code == 200:
-            return OpenFileResponse(
-                content, status_code=status_code, media_type="application/octet-stream"
-            )
 
-    logger.info("No valid content for %s, returning 404", path)
+        try:
+            chunk, status, headers = await anext(stream)
+            if status in (200, 304):
+                return True, status, headers, chunk, stream
+        except StopAsyncIteration:
+            pass
+
+        return False, None, None, None, None
+
+    # Try each upstream until success
+    for base_url in target_upstreams:
+        success, status_code, response_headers, first_chunk, stream = \
+            await stream_from_upstream(base_url)
+
+        if success:
+            async def response_stream():
+                yield first_chunk
+                async for chunk, _, _ in stream:
+                    yield chunk
+
+            return StreamingResponse(
+                response_stream(),
+                status_code=status_code,
+                media_type=response_headers.get('Content-Type', 'application/octet-stream'),
+                headers=response_headers
+            )
 
     return Response(status_code=404)
 

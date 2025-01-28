@@ -1,7 +1,8 @@
 [Unit]
 Description=Windows symbol server
-After=srv-cache-ntsymbols.mount symsrv-prepare.service
-Requires=srv-cache-ntsymbols.mount symsrv-prepare.service
+RequiresMountsFor=/srv/cache/ntsymbols
+After=network-online.target
+Requires=symsrv-update.service
 Before=nginx.service
 
 [Service]
@@ -13,6 +14,9 @@ WorkingDirectory=/srv/cache/ntsymbols
 ExecStart=/srv/cache/ntsymbols/.venv/bin/poetry run serve
 TimeoutStopSec=10
 PrivateTmp=true
+
+# Raise resource limits
+LimitNOFILE=8192
 
 # Hardening options
 ProtectSystem=strict

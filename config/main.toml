@@ -3,7 +3,7 @@
 uds = "/srv/cache/ntsymbols/run/symsrv.sock"
 #host = "0.0.0.0"
 #port = 80
-workers = 4
+workers = 8
 proxy_headers = true
 forwarded_allow_ips = "*"
 http = "httptools"
@@ -14,6 +14,11 @@ log_config = "config/log_config.yml"
 [disk_cache]
 path = "/srv/cache/ntsymbols/data"
 size = "64GB"
+
+[log_filters]
+ignore_access = [
+	{status = 404, path = "/index2.txt"},
+]
 
 # Specifies the TTLs for caching requests, in seconds
 [cache_ttl]

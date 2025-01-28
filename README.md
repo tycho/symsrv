@@ -29,14 +29,13 @@ development tools.
 
 ### Prerequisites
 
-- Python 3.12+ (will likely work on earlier versions, but not tested)
+- Python 3.10+ (will likely work on earlier versions, but not tested)
 - [Poetry](https://pypi.org/project/poetry/)
 - [FastAPI](https://pypi.org/project/fastapi/)
 - [Uvicorn](https://pypi.org/project/uvicorn/)
-- [HTTPX](https://pypi.org/project/httpx/)
-- [DiskCache](https://pypi.org/project/diskcache/)
-- [Humanize](https://pypi.org/project/humanize/)
-- [HumanFriendly](https://pypi.org/project/humanfriendly/)
+- [aiohttp](https://pypi.org/project/aiohttp/)
+- [aiofiles](https://pypi.org/project/aiofiles/)
+- [starlette](https://pypi.org/project/starlette/)
 
 ### Installation
 

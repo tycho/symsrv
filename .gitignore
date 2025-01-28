@@ -1,4 +1,5 @@
 /.cache
+/.envrc
 /.mypy_cache
 /.venv
 /data

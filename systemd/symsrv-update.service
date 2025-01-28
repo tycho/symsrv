@@ -1,6 +1,8 @@
 [Unit]
-Description=Windows symbol server setup
+Description=Windows symbol server prelaunch
+RequiresMountsFor=/srv/cache/ntsymbols
 After=network-online.target
+Before=symsrv.service nginx.service
 
 [Service]
 Type=oneshot
