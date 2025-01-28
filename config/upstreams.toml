@@ -1,12 +1,13 @@
 [[upstream]]
 name = "microsoft"
 base_url = "http://msdl.microsoft.com/download/symbols"
-extensions = [".pdb", ".dll"]
+extensions = [".pdb", ".dll", ".snupkg"]
 
 [[upstream]]
 name = "nuget"
 base_url = "https://symbols.nuget.org/download/symbols"
-extensions = [".snupkg"]
+extensions = [".pdb", ".dll", ".snupkg"]
+requires_symbolchecksum = true
 
 [[upstream]]
 name = "mozilla"

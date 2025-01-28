@@ -2,7 +2,7 @@
 # pylint: disable=C0114,C0115,C0116
 from contextlib import asynccontextmanager
 from email.utils import formatdate
-import typing
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 import datetime as dt
 import hashlib
 import os
@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.types import Scope, Receive, Send
 from tomlkit.toml_file import TOMLFile
+from tomlkit.items import Table
 import aiohttp
 import anyio
 import uvicorn
@@ -30,14 +31,14 @@ TTL_FAILURE_DEFAULT = 1 * 60 * 60  # 1 hour
 CHUNK_SIZE = 256 * 1024
 PROFILING_ENABLED = False
 
-cache_ttl: dict[int, int] = {}
+cache_ttl: Dict[int, int] = {}
 
 upstreams = []
 
-substring_blacklist: list[str] = []
+substring_blacklist: List[str] = []
 first_path_component_blacklist: set[str] = set()
-suffix_blacklist: list[str] = []
-ignore_access: set[typing.Dict[str, typing.Any]] = set()
+suffix_blacklist: List[str] = []
+ignore_access: set[Dict[str, Any]] = set()
 
 app = FastAPI()
 
@@ -48,7 +49,7 @@ def register_middleware(app: FastAPI):
         from pyinstrument.renderers.speedscope import SpeedscopeRenderer
 
         @app.middleware("http")
-        async def profile_request(request: Request, call_next: typing.Callable):
+        async def profile_request(request: Request, call_next: Callable):
             """Profile the current request
 
             Taken from https://pyinstrument.readthedocs.io/en/latest/guide.html#profile-a-web-request-in-fastapi
@@ -150,8 +151,9 @@ async def fetch_from_upstream(
     cache: AsyncDiskCache,
     cache_key: str,
     full_url: str,
+    request_headers: Dict[str,str],
     method: str
-) -> typing.AsyncIterator[typing.Tuple[bytes, int, typing.Dict[str, str]]]:
+) -> AsyncIterator[Tuple[bytes, int, Dict[str, str]]]:
     """
     Fetch from upstream and handle caching based on response status.
     Yields tuples of (chunk, status_code).
@@ -161,7 +163,7 @@ async def fetch_from_upstream(
     For other responses, yields nothing and doesn't cache.
     """
     try:
-        async with session.request(method, full_url) as response:
+        async with session.request(method, full_url, headers=request_headers) as response:
             status_code = response.status
 
             if status_code == 200:
@@ -200,6 +202,7 @@ async def fetch_from_upstream(
                     chunks_to_async_gen(chunks),
                     ttl=cache_ttl.get(200, TTL_SUCCESS_DEFAULT),
                     tags={
+                        'full_url': full_url,
                         'status_code': 200,
                         'etag': etag,
                         'headers': response_headers
@@ -212,13 +215,13 @@ async def fetch_from_upstream(
                     if value := response.headers.get(header):
                         response_headers[header] = value
 
-                # Create a list to store chunks for caching
                 # Cache client errors with empty content
                 await cache.set_streaming(
                     cache_key,
                     empty_async_gen(),  # Empty content
                     ttl=cache_ttl.get(status_code, TTL_FAILURE_DEFAULT),
                     tags={
+                        'full_url': full_url,
                         'status_code': status_code,
                         'headers': response_headers
                     }
@@ -241,15 +244,19 @@ async def fetch_from_upstream(
 async def fetch_cached_or_live(
     session: aiohttp.ClientSession,
     cache: AsyncDiskCache,
-    cache_key: str,
-    full_url: str,
+    upstream: Table,
     method: str,
-    request_headers: typing.Optional[typing.Dict[str, str]] = None
-) -> typing.AsyncIterator[typing.Tuple[bytes, int, typing.Dict[str, str]]]:
+    path: str,
+    request_headers: Optional[Dict[str, str]] = None
+) -> AsyncIterator[Tuple[bytes, int, Dict[str, str]]]:
     """
     Try to fetch from cache first, fall back to live request if needed.
     Yields tuples of (chunk, status_code).
     """
+    base_url = upstream["base_url"]
+    full_url = f"{base_url.rstrip('/')}{path}"
+    cache_key = f"{method}:{full_url}"
+
     # Check cache first
     if metadata := await cache.get_metadata(cache_key):
         status_code = metadata.tags.get('status_code', None)
@@ -288,23 +295,34 @@ async def fetch_cached_or_live(
                 yield chunk, status_code, cached_headers
             return
 
+    # Collect some headers we're allowed to pass through from the client
+    upstream_request_headers = {}
+
+    # This will unbreak symbols.nuget.org, since it requires a SymbolChecksum
+    # header, regardless of its actual value.
+    if 'symbolchecksum' in request_headers:
+        upstream_request_headers['symbolchecksum'] = request_headers['symbolchecksum']
+    elif upstream.get('requires_symbolchecksum', False):
+        upstream_request_headers['symbolchecksum'] = 'invalid'
+
     # If not in cache or expired, fetch from upstream
     async for chunk, status, headers in fetch_from_upstream(
         session,
         cache,
         cache_key,
         full_url,
+        upstream_request_headers,
         method
     ):
         yield chunk, status, headers
 
 
-def get_extension(path: str):
+def get_extension(path: str) -> str:
     _, ext = os.path.splitext(path)
     return ext
 
 
-def choose_upstreams(path: str):
+def choose_upstreams(path: str) -> List[Table]:
     ext = get_extension(path).lower()
 
     if ext == ".pd_":
@@ -335,12 +353,12 @@ def choose_upstreams(path: str):
             include = True
 
         if include:
-            target_upstreams.append(upstream["base_url"])
+            target_upstreams.append(upstream)
 
     return target_upstreams
 
 
-def is_blacklisted_path(path: str):
+def is_blacklisted_path(path: str) -> bool:
     for part in substring_blacklist:
         if part in path:
             logger.debug(
@@ -380,17 +398,15 @@ async def proxy(path: str, request: Request):
     session = request.app.state.session  # We'll need to change this to aiohttp.ClientSession
     cache = request.app.state.cache      # Our AsyncDiskCache instance
 
-    async def stream_from_upstream(base_url: str):
+    async def stream_from_upstream(upstream: Table):
         """Try a single upstream, return (success, stream) tuple"""
-        full_url = f"{base_url.rstrip('/')}{path}"
-        cache_key = f"{request.method}:{full_url}"
 
         stream = fetch_cached_or_live(
             session,
             cache,
-            cache_key,
-            full_url,
+            upstream,
             request.method,
+            path,
             dict(request.headers)
         )
 
@@ -405,8 +421,8 @@ async def proxy(path: str, request: Request):
 
     # Create tasks for all upstreams
     tasks = [
-        asyncio.create_task(stream_from_upstream(base_url))
-        for base_url in target_upstreams
+        asyncio.create_task(stream_from_upstream(upstream))
+        for upstream in target_upstreams
     ]
 
     try:
