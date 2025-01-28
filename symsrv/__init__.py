@@ -231,7 +231,7 @@ async def fetch_from_upstream(
                 )
                 # Don't yield anything for other status codes
 
-    except aiohttp.ClientError as exc:
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         logger.error("Request to %s failed: %s", full_url, exc)
         # Don't yield anything for connection errors
 
