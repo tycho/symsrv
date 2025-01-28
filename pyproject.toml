@@ -22,6 +22,11 @@ dependencies = [
 	"websockets (>=14.2,<15.0)",
 ]
 
+[project.optional-dependencies]
+profiling = [
+	"pyinstrument (>=5.0.1,<6.0.0)",
+]
+
 [project.scripts]
 serve = "symsrv:main"
 
