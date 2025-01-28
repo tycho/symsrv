@@ -124,8 +124,10 @@ async def startup_event():
     upstream_config = TOMLFile("config/upstreams.toml").read()
     upstreams = upstream_config["upstream"]
 
+    timeouts = aiohttp.ClientTimeout(sock_connect=5.0, sock_read=20.0)
+
     app.state.cache = AsyncDiskCache(cache_path)
-    app.state.session = aiohttp.ClientSession()
+    app.state.session = aiohttp.ClientSession(timeout=timeouts)
 
 
 @app.on_event("shutdown")
