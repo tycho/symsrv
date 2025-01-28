@@ -401,23 +401,41 @@ async def proxy(path: str, request: Request):
 
         return False, None, None, None, None
 
-    # Try each upstream until success
-    for base_url in target_upstreams:
-        success, status_code, response_headers, first_chunk, stream = \
-            await stream_from_upstream(base_url)
+    # Create tasks for all upstreams
+    tasks = [
+        asyncio.create_task(stream_from_upstream(base_url))
+        for base_url in target_upstreams
+    ]
 
-        if success:
-            async def response_stream():
-                yield first_chunk
-                async for chunk, _, _ in stream:
-                    yield chunk
+    try:
+        # As each task completes, check if it's successful
+        for done_task in asyncio.as_completed(tasks):
+            success, status_code, response_headers, first_chunk, stream = await done_task
 
-            return StreamingResponse(
-                response_stream(),
-                status_code=status_code,
-                media_type=response_headers.get('Content-Type', 'application/octet-stream'),
-                headers=response_headers
-            )
+            if success:
+                for task in tasks:
+                    if task is not done_task and not task.done():
+                        task.cancel()
+
+                async def response_stream():
+                    yield first_chunk
+                    async for chunk, _, _ in stream:
+                        yield chunk
+
+                return StreamingResponse(
+                    response_stream(),
+                    status_code=status_code,
+                    media_type=response_headers.get('Content-Type', 'application/octet-stream'),
+                    headers=response_headers
+                )
+
+    finally:
+        # Cancel any remaining tasks
+        remaining = [t for t in tasks if not t.done()]
+        if remaining:
+            for task in remaining:
+                task.cancel()
+            await asyncio.gather(*remaining, return_exceptions=True)
 
     return Response(status_code=404)
 
