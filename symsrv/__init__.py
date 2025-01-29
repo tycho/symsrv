@@ -151,6 +151,7 @@ async def fetch_from_upstream(
     cache: AsyncDiskCache,
     cache_key: str,
     full_url: str,
+    allow_cache: bool,
     request_headers: Dict[str,str],
     method: str
 ) -> AsyncIterator[Tuple[bytes, int, Dict[str, str]]]:
@@ -184,7 +185,8 @@ async def fetch_from_upstream(
                 # Stream the response while collecting chunks
                 async for chunk in response.content.iter_chunks():
                     chunk_data = chunk[0]  # aiohttp returns tuples of (data, end_of_chunk)
-                    chunks.append(chunk_data)
+                    if allow_cache:
+                        chunks.append(chunk_data)
                     yield chunk_data, 200, response_headers
 
                 if not etag:
@@ -197,17 +199,18 @@ async def fetch_from_upstream(
                     etag = f'"{hasher.hexdigest()}"'
 
                 # Cache the successful response
-                await cache.set_streaming(
-                    cache_key,
-                    chunks_to_async_gen(chunks),
-                    ttl=cache_ttl.get(200, TTL_SUCCESS_DEFAULT),
-                    tags={
-                        'full_url': full_url,
-                        'status_code': 200,
-                        'etag': etag,
-                        'headers': response_headers
-                    }
-                )
+                if allow_cache:
+                    await cache.set_streaming(
+                        cache_key,
+                        chunks_to_async_gen(chunks),
+                        ttl=cache_ttl.get(200, TTL_SUCCESS_DEFAULT),
+                        tags={
+                            'full_url': full_url,
+                            'status_code': 200,
+                            'etag': etag,
+                            'headers': response_headers
+                        }
+                    )
 
             elif 400 <= status_code < 500:
                 response_headers = {}
@@ -216,16 +219,17 @@ async def fetch_from_upstream(
                         response_headers[header] = value
 
                 # Cache client errors with empty content
-                await cache.set_streaming(
-                    cache_key,
-                    empty_async_gen(),  # Empty content
-                    ttl=cache_ttl.get(status_code, TTL_FAILURE_DEFAULT),
-                    tags={
-                        'full_url': full_url,
-                        'status_code': status_code,
-                        'headers': response_headers
-                    }
-                )
+                if allow_cache:
+                    await cache.set_streaming(
+                        cache_key,
+                        empty_async_gen(),  # Empty content
+                        ttl=cache_ttl.get(status_code, TTL_FAILURE_DEFAULT),
+                        tags={
+                            'full_url': full_url,
+                            'status_code': status_code,
+                            'headers': response_headers
+                        }
+                    )
                 # Don't yield anything for 4xx errors
 
             else:
@@ -253,6 +257,7 @@ async def fetch_cached_or_live(
     Try to fetch from cache first, fall back to live request if needed.
     Yields tuples of (chunk, status_code).
     """
+    allow_cache = not upstream.get("nocache", False)
     base_url = upstream["base_url"]
     full_url = f"{base_url.rstrip('/')}{path}"
     cache_key = f"{method}:{full_url}"
@@ -290,10 +295,11 @@ async def fetch_cached_or_live(
                 # If we can't parse the dates, ignore the header
                 pass
 
-        if cached_stream := await cache.get_streaming(cache_key):
-            async for chunk in cached_stream:
-                yield chunk, status_code, cached_headers
-            return
+        if allow_cache:
+            if cached_stream := await cache.get_streaming(cache_key):
+                async for chunk in cached_stream:
+                    yield chunk, status_code, cached_headers
+                return
 
     # Collect some headers we're allowed to pass through from the client
     upstream_request_headers = {}
@@ -311,6 +317,7 @@ async def fetch_cached_or_live(
         cache,
         cache_key,
         full_url,
+        allow_cache,
         upstream_request_headers,
         method
     ):
