@@ -28,7 +28,7 @@ class AsyncDiskCache:
         self,
         cache_dir: str,
         default_ttl: Optional[float] = None,
-        cleanup_interval: float = 3600,  # Run cleanup every hour by default
+        cleanup_interval: float = 28800, # Run cleanup every hour by default
         subdirectory_depth: int = 2,     # Number of subdirectory levels
         subdirectory_width: int = 2      # Characters per subdirectory level
     ):
