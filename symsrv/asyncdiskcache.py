@@ -157,13 +157,6 @@ class AsyncDiskCache:
             async with aiofiles.open(meta_path, 'r') as f:
                 data = json.loads(await f.read())
                 metadata = CacheMetadata(**data)
-
-                # Check if expired
-                if metadata.ttl is not None:
-                    if time.time() - metadata.created_at > metadata.ttl:
-                        await self.delete(key)
-                        return None
-
                 return metadata
         except (FileNotFoundError, json.JSONDecodeError):
             return None
