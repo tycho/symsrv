@@ -387,6 +387,8 @@ class AsyncDiskCache:
             meta_files = list(self.metadata_dir.rglob("*.json"))
             logger.info(f"Found {len(meta_files)} cache files, checking for expired entries...")
 
+            num_removed = 0
+
             for i in range(0, len(meta_files), batch_size):
                 batch = meta_files[i:i + batch_size]
                 # Process one file at a time instead of gathering
@@ -407,6 +409,7 @@ class AsyncDiskCache:
 
                             if create_expired and modify_expired:
                                 data_path = self._get_paths_from_hash(meta_path.stem)[0]
+                                num_removed += 1
                                 await self._remove_files([data_path, meta_path])
                     except (FileNotFoundError, json.JSONDecodeError, TypeError, OSError) as e:
                         logger.error(f"Error processing cache file {meta_path}: {e}")
@@ -414,6 +417,9 @@ class AsyncDiskCache:
 
                 # Add a small delay between batches
                 await asyncio.sleep(0.01)
+
+            if num_removed > 0:
+                logger.info(f"Removed {num_removed} expired entries")
 
         except Exception as e:
             logger.error(f"Error during cache cleanup: {e}", exc_info=True)
