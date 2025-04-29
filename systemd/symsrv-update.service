@@ -9,7 +9,7 @@ Type=oneshot
 User=http
 Group=http
 WorkingDirectory=/srv/cache/ntsymbols
-ExecStart=/usr/bin/make poetry-install
+ExecStart=/usr/bin/make sync
 PrivateTmp=true
 
 # Hardening options

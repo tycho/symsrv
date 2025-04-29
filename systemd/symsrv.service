@@ -11,7 +11,7 @@ Type=exec
 User=http
 Group=http
 WorkingDirectory=/srv/cache/ntsymbols
-ExecStart=/srv/cache/ntsymbols/.venv/bin/poetry run serve
+ExecStart=/usr/bin/make run
 TimeoutStopSec=10
 PrivateTmp=true
 
@@ -30,7 +30,7 @@ ProtectHome=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
-MemoryDenyWriteExecute=true
+MemoryDenyWriteExecute=false
 PrivateDevices=true
 PrivateUsers=true
 RestrictSUIDSGID=true

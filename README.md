@@ -30,7 +30,7 @@ development tools.
 ### Prerequisites
 
 - Python 3.10+ (will likely work on earlier versions, but not tested)
-- [Poetry](https://pypi.org/project/poetry/)
+- [uv](https://github.com/astral-sh/uv/)
 - [FastAPI](https://pypi.org/project/fastapi/)
 - [Uvicorn](https://pypi.org/project/uvicorn/)
 - [aiohttp](https://pypi.org/project/aiohttp/)
@@ -47,7 +47,7 @@ development tools.
 
 2. Install the required dependencies:
    ```sh
-   make poetry-install
+   make sync
    ```
 
 3. Edit config files in the `config` subdirectory to match your needs.
@@ -61,7 +61,7 @@ development tools.
 
 2. Run the FastAPI server:
    ```sh
-   .venv/bin/poetry run serve
+   make run
    ```
 
 The server will listen on a UNIX socket by default. You can use an nginx
