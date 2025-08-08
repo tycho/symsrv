@@ -345,7 +345,7 @@ def choose_upstreams(path: str) -> List[Table]:
         # Don't warn on this guy, it's commonly requested
         ext = None
 
-    if ext not in [None, ".exe", ".pdb", ".dll", ".snupkg"]:
+    if ext not in [None, ".exe", ".pdb", ".sys", ".dll", ".snupkg"]:
         logger.warning(
             "Path '%s' doesn't have a recognized file extension (%s)", path, ext
         )
