@@ -22,8 +22,9 @@ development tools.
   upstream, reducing unnecessary outbound HTTP requests.
 
 - **Support for Common Development Tools**: Works seamlessly with Windows
-  development tools like Visual Studio, WinDbg, and Windows Performance Analyzer
-  via the `_NT_SYMBOL_PATH` environment variable.
+  development tools like Visual Studio, WinDbg, and Windows Performance
+  Analyzer via the `_NT_SYMBOL_PATH` and `_NT_EXECUTABLE_IMAGE_PATH`
+  environment variables.
 
 ## Usage
 
@@ -104,11 +105,11 @@ server {
 
 ### Setting Up Your Development Environment
 
-Set the `_NT_SYMBOL_PATH` environment variable on your system to use the
-caching proxy:
+Set the environment variables on your system to use the caching proxy:
 
 ```cmd
 set _NT_SYMBOL_PATH=SRV*C:\SymbolCache;http://symbols.example.com/
+set _NT_EXECUTABLE_IMAGE_PATH=SRV*C:\SymbolCache;http://symbols.example.com/
 ```
 
 Replace `C:\SymbolCache` with your local cache directory and
