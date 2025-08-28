@@ -1,40 +1,40 @@
 [[upstream]]
 name = "microsoft"
 base_url = "http://msdl.microsoft.com/download/symbols"
-extensions = [".pdb", ".dll", ".snupkg"]
+extensions = [".pdb", ".dll", ".exe", ".sys", ".snupkg"]
 
 [[upstream]]
 name = "nuget"
 base_url = "https://symbols.nuget.org/download/symbols"
-extensions = [".pdb", ".dll", ".snupkg"]
+extensions = [".pdb", ".dll", ".exe", ".sys", ".snupkg"]
 requires_symbolchecksum = true
 
 [[upstream]]
 name = "mozilla"
 base_url = "https://symbols.mozilla.org"
-extensions = [".pdb", ".dll"]
+extensions = [".pdb", ".dll", ".exe"]
 
 [[upstream]]
 name = "chrome"
 base_url = "https://chromium-browser-symsrv.commondatastorage.googleapis.com"
-extensions = [".pdb", ".dll"]
+extensions = [".pdb", ".dll", ".exe"]
 
 [[upstream]]
 name = "renderdoc"
 base_url = "https://renderdoc.org/symbols"
-extensions = [".pdb", ".dll"]
+extensions = [".pdb", ".dll", ".exe"]
 
 [[upstream]]
 name = "nvidia"
 base_url = "https://driver-symbols.nvidia.com"
-extensions = [".dll"]
+extensions = [".dll", ".exe", ".sys"]
 
 [[upstream]]
 name = "amd"
 base_url = "https://download.amd.com/dir/bin"
-extensions = [".dll"]
+extensions = [".dll", ".exe", ".sys"]
 
 [[upstream]]
 name = "intel"
 base_url = "https://software.intel.com/sites/downloads/symbols"
-extensions = [".dll"]
+extensions = [".dll", ".exe", ".sys"]
