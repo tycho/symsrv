@@ -128,17 +128,19 @@ class AsyncDiskCache:
 
     def _get_subdirectory_path(self, key_hash: str, base_dir: Path) -> Path:
         """Creates a subdirectory path based on the key hash."""
-        parts = [
-            key_hash[i:i + self.subdirectory_width]
-            for i in range(0, self.subdirectory_depth * self.subdirectory_width, self.subdirectory_width)
-        ]
+        w = self.subdirectory_width
+        d = self.subdirectory_depth
 
-        current_path = base_dir
-        for part in parts:
-            current_path = current_path / part
-            current_path.mkdir(exist_ok=True)
+        # Build the full path without touching the filesystem
+        path = base_dir.joinpath(*(key_hash[i:i+w] for i in range(0, d*w, w)))
 
-        return current_path
+        # Fast path: most of the time it already exists
+        if path.is_dir():
+            return path
+
+        # Slow path: create the whole tree in one shot
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _get_paths(self, key: str) -> tuple[Path, Path]:
         """Get the paths for data and metadata files for a given key."""
