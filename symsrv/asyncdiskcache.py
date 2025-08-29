@@ -207,6 +207,25 @@ class AsyncDiskCache:
         async with aiofiles.open(meta_path, 'w') as f:
             await f.write(json.dumps(vars(metadata)))
 
+    async def get_nginx_redirect_path(self, key: str) -> str:
+        """
+        Get the NGINX X-Accel-Redirect response.
+
+        Returns None if item doesn't exist or is expired.
+        """
+        data_path, meta_path = self._get_paths(key)
+
+        # Is the data file missing?
+        if not data_path.is_file():
+            return None
+
+        # Touch the metadata file to update its modify timestamp
+        await self._atime_queue.put(meta_path)
+
+        redirect_path = Path("/_symsrv_cache/") / data_path.relative_to(self.data_dir)
+
+        return str(redirect_path)
+
     async def get_streaming(self, key: str) -> Optional[AsyncIterator[bytes]]:
         """
         Retrieve data from cache as an async stream.

@@ -87,6 +87,19 @@ server {
     access_log /srv/cache/ntsymbols/logs/access.log;
     error_log /srv/cache/ntsymbols/logs/error.log;
 
+    # Optional: Use this if you have disk_cache.mode="nginx"
+    location ^~ /_symsrv_cache/ {
+        internal;
+        alias /srv/cache/ntsymbols/data/data/;
+        sendfile on;
+        aio threads;
+        tcp_nopush on;
+        etag off;
+        add_header ETag $upstream_http_etag;
+        add_header Last-Modified $upstream_http_last_modified;
+        types { } default_type application/octet-stream;
+    }
+
     location / {
         client_max_body_size 4g;
         proxy_redirect off;

@@ -22,6 +22,9 @@ import uvicorn
 
 from .asyncdiskcache import AsyncDiskCache
 
+CACHE_MODE_STANDALONE = 0
+CACHE_MODE_NGINX = 1
+
 # Set up logging
 logger = logging.getLogger("uvicorn.error")
 
@@ -32,6 +35,7 @@ CHUNK_SIZE = 256 * 1024
 PROFILING_ENABLED = False
 
 cache_ttl: Dict[int, int] = {}
+cache_mode: int = CACHE_MODE_STANDALONE
 
 upstreams = []
 
@@ -103,6 +107,13 @@ async def startup_event():
     for key, value in main_config["cache_ttl"].items():
         cache_ttl[int(key)] = value
     cache_path = main_config["disk_cache"]["path"]
+
+    cache_modes = {
+        "standalone": CACHE_MODE_STANDALONE,
+        "nginx": CACHE_MODE_NGINX,
+    }
+    global cache_mode
+    cache_mode = cache_modes.get(main_config["disk_cache"].get("mode"), CACHE_MODE_STANDALONE)
 
     global ignore_access
     for filter_spec in main_config["log_filters"]["ignore_access"]:
@@ -289,16 +300,26 @@ async def fetch_cached_or_live(
                 req_date = time.strptime(if_modified_since, "%a, %d %b %Y %H:%M:%S GMT")
                 cache_date = time.strptime(last_modified, "%a, %d %b %Y %H:%M:%S GMT")
                 if cache_date <= req_date:
-                    yield b'', 304, cached_headers
+                    yield b'', 304, response_headers
                     return
             except ValueError:
                 # If we can't parse the dates, ignore the header
                 pass
 
         if allow_cache:
+            if cache_mode == CACHE_MODE_NGINX:
+                # If we are in nginx cache mode, we can have nginx do the heavy
+                # lifting for the data transfer.
+                redirect_path = await cache.get_nginx_redirect_path(cache_key)
+                if redirect_path is not None:
+                    response_headers['X-Accel-Redirect'] = redirect_path
+                    yield b'', 200, response_headers
+                    return
+
             if cached_stream := await cache.get_streaming(cache_key):
+                response_headers['Content-Length'] = str(metadata.size)
                 async for chunk in cached_stream:
-                    yield chunk, status_code, cached_headers
+                    yield chunk, status_code, response_headers
                 return
 
     # Collect some headers we're allowed to pass through from the client
