@@ -1,5 +1,6 @@
 /.cache
 /.envrc
+/.idea
 /.mypy_cache
 /.venv
 /data

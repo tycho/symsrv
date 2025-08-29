@@ -1,347 +1,66 @@
 #!/usr/bin/python
-# pylint: disable=C0114,C0115,C0116
-from contextlib import asynccontextmanager
-from email.utils import formatdate
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
-import datetime as dt
-import hashlib
-import os
-import time
-import logging
+# pylint: disable=C0114,C0115,C0116,C0301
+
 import asyncio
+import os
+import ssl, socket
+import time
+from typing import AsyncGenerator, Dict, Iterable, List, Optional, Set, Tuple
 
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse
-from starlette.background import BackgroundTask
-from starlette.types import Scope, Receive, Send
-from tomlkit.toml_file import TOMLFile
-from tomlkit.items import Table
 import aiohttp
-import anyio
 import uvicorn
+from fastapi import FastAPI, Request, Response
+from starlette.responses import StreamingResponse
+import tomllib  # Python 3.11+
 
-from .asyncdiskcache import AsyncDiskCache
+from .cachekey import CacheKey, make_cache_key
+from .asyncsqlitecache import AsyncSqliteCache
+from .singleflight import SingleFlight, UDSSingleFlight, NoOpSingleFlight
+from .log_queue import install_queue_logging, shutdown_queue_logging
 
-CACHE_MODE_STANDALONE = 0
-CACHE_MODE_NGINX = 1
+import logging
 
-# Set up logging
 logger = logging.getLogger("uvicorn.error")
-
-TTL_SUCCESS_DEFAULT = 8 * 60 * 60  # 8 hours
-TTL_FAILURE_DEFAULT = 1 * 60 * 60  # 1 hour
-
-PROFILING_ENABLED = False
-
-cache_ttl: Dict[int, int] = {}
-cache_mode: int = CACHE_MODE_STANDALONE
-
-upstreams = []
-
-substring_blacklist: List[str] = []
-first_path_component_blacklist: set[str] = set()
-suffix_blacklist: List[str] = []
-ignore_access: set[Dict[str, Any]] = set()
 
 app = FastAPI()
 
-def register_middleware(app: FastAPI):
-    if PROFILING_ENABLED == True:
-        from pyinstrument import Profiler
-        from pyinstrument.renderers.html import HTMLRenderer
-        from pyinstrument.renderers.speedscope import SpeedscopeRenderer
+# =====================
+# Config / constants
+# =====================
 
-        @app.middleware("http")
-        async def profile_request(request: Request, call_next: Callable):
-            """Profile the current request
+# TTLs (seconds)
+TTL_SUCCESS_DEFAULT = 8 * 60 * 60  # 8h
+TTL_FAILURE_DEFAULT = 60 * 60  # 1h for 4xx negative cache
 
-            Taken from https://pyinstrument.readthedocs.io/en/latest/guide.html#profile-a-web-request-in-fastapi
-            with small improvements.
+# Upstream read chunk size (aiohttp)
+READ_CHUNK = 1 << 23  # 8 MiB
 
-            """
-            # we map a profile type to a file extension, as well as a pyinstrument profile renderer
-            profile_type_to_ext = {"html": "html", "speedscope": "speedscope.json"}
-            profile_type_to_renderer = {
-                "html": HTMLRenderer,
-                "speedscope": SpeedscopeRenderer,
-            }
+# Recognized extensions for grouping
+RECOGNIZED_EXTS = {".exe", ".dbg", ".pdb", ".sys", ".dll", ".snupkg"}
 
-            # if the `profile=true` HTTP query argument is passed, we profile the request
-            if request.query_params.get("profile", False):
+# Blacklists (loaded from config)
+substring_blacklist: List[str] = []
+suffix_blacklist: List[str] = []
+first_path_component_blacklist: List[str] = []
 
-                # The default profile format is speedscope
-                profile_type = request.query_params.get("profile_format", "speedscope")
+# Upstreams (loaded from config)
+upstreams: Dict[str, dict] = {}
 
-                # we profile the request along with all additional middlewares, by interrupting
-                # the program every 1ms1 and records the entire stack at that point
-                with Profiler(interval=0.001, async_mode="enabled") as profiler:
-                    response = await call_next(request)
+# Log filtering
+ignore_access: Set[Tuple[int, str]] = set()
 
-                # we dump the profiling into a file
-                extension = profile_type_to_ext[profile_type]
-                renderer = profile_type_to_renderer[profile_type]()
-                with open(f"profile.{extension}", "w") as out:
-                    out.write(profiler.output(renderer=renderer))
-                return response
+# Cache selection
+cache_backend_type: str = "disk"  # "disk" | "sqlite"   (backend)
+cache_mode: str = "standalone"  # "standalone" | "nginx" (serving mode)
+cache_ttl: Dict[int, int] = {}
 
-            # Proceed without profiling
-            return await call_next(request)
-register_middleware(app)
-
-class FilteredAccessLog(logging.Filter):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        filter_match = (record.args[4], record.args[2])
-        if filter_match in ignore_access:
-            return False
-        return True
-
-@app.on_event("startup")
-async def startup_event():
-    # Load main config
-    global cache_ttl
-    main_config = TOMLFile("config/main.toml").read()
-    for key, value in main_config["cache_ttl"].items():
-        cache_ttl[int(key)] = value
-    cache_path = main_config["disk_cache"]["path"]
-
-    cache_modes = {
-        "standalone": CACHE_MODE_STANDALONE,
-        "nginx": CACHE_MODE_NGINX,
-    }
-    global cache_mode
-    cache_mode = cache_modes.get(main_config["disk_cache"].get("mode"), CACHE_MODE_STANDALONE)
-
-    global ignore_access
-    for filter_spec in main_config["log_filters"]["ignore_access"]:
-        ignore_access.add((int(filter_spec["status"]), str(filter_spec["path"])))
-    logging.getLogger("uvicorn.access").addFilter(FilteredAccessLog())
-
-    # Load blacklist config
-    global substring_blacklist
-    global first_path_component_blacklist
-    global suffix_blacklist
-    bl_config = TOMLFile("config/blacklist.toml").read()
-    substring_blacklist = bl_config["substring_blacklist"]["patterns"]
-    first_path_component_blacklist = set(
-        bl_config["first_path_component_blacklist"]["names"]
-    )
-    suffix_blacklist = bl_config["suffix_blacklist"]["suffixes"]
-
-    # Load upstream config
-    global upstreams
-    upstream_config = TOMLFile("config/upstreams.toml").read()
-    upstreams = upstream_config["upstream"]
-
-    timeouts = aiohttp.ClientTimeout(sock_connect=5.0, sock_read=20.0)
-
-    app.state.cache = AsyncDiskCache(cache_path)
-    app.state.session = aiohttp.ClientSession(timeout=timeouts)
+# =====================
+# Helpers
+# =====================
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await app.state.cache.close()
-    await app.state.session.close()
-
-
-async def chunks_to_async_gen(chunks):
-    for chunk in chunks:
-        yield chunk
-
-
-async def empty_async_gen():
-    yield b''
-
-
-async def fetch_from_upstream(
-    session: aiohttp.ClientSession,
-    cache: AsyncDiskCache,
-    cache_key: str,
-    full_url: str,
-    allow_cache: bool,
-    request_headers: Dict[str,str],
-    method: str
-) -> AsyncIterator[Tuple[bytes, int, Dict[str, str]]]:
-    """
-    Fetch from upstream and handle caching based on response status.
-    Yields tuples of (chunk, status_code).
-
-    For 200 responses, yields and caches the response chunks.
-    For 4xx responses, yields nothing but caches an empty response.
-    For other responses, yields nothing and doesn't cache.
-    """
-    try:
-        async with session.request(method, full_url, headers=request_headers) as response:
-            status_code = response.status
-
-            if status_code == 200:
-                # Create a list to store chunks for caching
-                chunks = []
-
-                # Get an upstream ETag if possible
-                response_headers = {}
-                etag = response.headers.get('ETag')
-
-                if etag:
-                    response_headers['ETag'] = etag
-
-                for header in ['Content-Type', 'Cache-Control', 'Last-Modified']:
-                    if value := response.headers.get(header):
-                        response_headers[header] = value
-
-                # Stream the response while collecting chunks
-                async for chunk in response.content.iter_chunks():
-                    chunk_data = chunk[0]  # aiohttp returns tuples of (data, end_of_chunk)
-                    if allow_cache:
-                        chunks.append(chunk_data)
-                    yield chunk_data, 200, response_headers
-
-                if not etag:
-                    hasher = hashlib.md5()
-                    total_size = sum(len(chunk) for chunk in chunks)
-                    hasher.update(str(total_size).encode())
-                    hasher.update(str(int(time.time())).encode())
-                    if chunks:
-                        hasher.update(chunks[0][:1024])
-                    etag = f'"{hasher.hexdigest()}"'
-
-                # Cache the successful response
-                if allow_cache:
-                    await cache.set_streaming(
-                        cache_key,
-                        chunks_to_async_gen(chunks),
-                        ttl=cache_ttl.get(200, TTL_SUCCESS_DEFAULT),
-                        tags={
-                            'full_url': full_url,
-                            'status_code': 200,
-                            'etag': etag,
-                            'headers': response_headers
-                        }
-                    )
-
-            elif 400 <= status_code < 500:
-                response_headers = {}
-                for header in ['Cache-Control']:
-                    if value := response.headers.get(header):
-                        response_headers[header] = value
-
-                # Cache client errors with empty content
-                if allow_cache:
-                    await cache.set_streaming(
-                        cache_key,
-                        empty_async_gen(),  # Empty content
-                        ttl=cache_ttl.get(status_code, TTL_FAILURE_DEFAULT),
-                        tags={
-                            'full_url': full_url,
-                            'status_code': status_code,
-                            'headers': response_headers
-                        }
-                    )
-                # Don't yield anything for 4xx errors
-
-            else:
-                logger.error(
-                    "Request to %s failed with status %d",
-                    full_url,
-                    status_code
-                )
-                # Don't yield anything for other status codes
-
-    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-        logger.error("Request to %s failed: %s", full_url, exc)
-        # Don't yield anything for connection errors
-
-
-async def fetch_cached_or_live(
-    session: aiohttp.ClientSession,
-    cache: AsyncDiskCache,
-    upstream: Table,
-    method: str,
-    path: str,
-    request_headers: Optional[Dict[str, str]] = None
-) -> AsyncIterator[Tuple[bytes, int, Dict[str, str]]]:
-    """
-    Try to fetch from cache first, fall back to live request if needed.
-    Yields tuples of (chunk, status_code).
-    """
-    allow_cache = not upstream.get("nocache", False)
-    base_url = upstream["base_url"]
-    full_url = f"{base_url.rstrip('/')}{path}"
-    cache_key = f"{method}:{full_url}"
-
-    # Check cache first
-    if metadata := await cache.get_metadata(cache_key):
-        status_code = metadata.tags.get('status_code', None)
-        cached_headers = metadata.tags.get('headers', {})
-        response_headers = {}
-
-        # In a cached response that meets the 'If-None-Match' or
-        # 'If-Modified-Since' conditions, we provide ETag and Last-Modified.
-        if last_modified := cached_headers.get('Last-Modified'):
-            response_headers['Last-Modified'] = last_modified
-        if cached_etag := cached_headers.get('ETag'):
-            response_headers['ETag'] = cached_etag
-
-        # Check if we have an ETag match
-        if (if_none_match := request_headers.get('if-none-match')) and cached_etag:
-            if if_none_match == cached_etag:
-                # Return just headers with 304 status
-                yield b'', 304, response_headers
-                return
-
-        # Check If-Modified-Since
-        if (if_modified_since := request_headers.get('if-modified-since')) and last_modified:
-            try:
-                # Parse both dates and compare
-                req_date = time.strptime(if_modified_since, "%a, %d %b %Y %H:%M:%S GMT")
-                cache_date = time.strptime(last_modified, "%a, %d %b %Y %H:%M:%S GMT")
-                if cache_date <= req_date:
-                    yield b'', 304, response_headers
-                    return
-            except ValueError:
-                # If we can't parse the dates, ignore the header
-                pass
-
-        if allow_cache:
-            if cache_mode == CACHE_MODE_NGINX:
-                # If we are in nginx cache mode, we can have nginx do the heavy
-                # lifting for the data transfer.
-                redirect_path = await cache.get_nginx_redirect_path(cache_key)
-                if redirect_path is not None:
-                    response_headers['X-Accel-Redirect'] = redirect_path
-                    yield b'', 200, response_headers
-                    return
-
-            if cached_stream := await cache.get_streaming(cache_key):
-                response_headers['Content-Length'] = str(metadata.size)
-                async for chunk in cached_stream:
-                    yield chunk, status_code, response_headers
-                return
-
-    # Collect some headers we're allowed to pass through from the client
-    upstream_request_headers = {}
-
-    # This will unbreak symbols.nuget.org, since it requires a SymbolChecksum
-    # header, regardless of its actual value.
-    if 'symbolchecksum' in request_headers:
-        upstream_request_headers['symbolchecksum'] = request_headers['symbolchecksum']
-    elif upstream.get('requires_symbolchecksum', False):
-        upstream_request_headers['symbolchecksum'] = 'invalid'
-
-    # If not in cache or expired, fetch from upstream
-    async for chunk, status, headers in fetch_from_upstream(
-        session,
-        cache,
-        cache_key,
-        full_url,
-        allow_cache,
-        upstream_request_headers,
-        method
-    ):
-        yield chunk, status, headers
+def _httpdate_now_gmt() -> str:
+    return time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
 
 
 def get_extension(path: str) -> str:
@@ -349,147 +68,688 @@ def get_extension(path: str) -> str:
     return ext
 
 
-def choose_upstreams(path: str) -> List[Table]:
-    ext = get_extension(path).lower()
+def upstream_priorities(all_upstreams: dict) -> List[int]:
+    prios = {int(x.get("priority", 10)) for x in all_upstreams}
+    return sorted(prios)
 
+
+def upstreams_for_path(
+    all_upstreams: dict, path: str, cachable: bool
+) -> Dict[str, dict]:
+    """
+    Find any cachable upstreams that might be able to handle this request. This
+    allows us to frontload the cache lookups.
+    """
+    ext: Optional[str] = get_extension(path).lower()
     if ext == ".pd_":
         ext = ".pdb"
-
-    if ext == ".dl_":
+    elif ext == ".dl_":
         ext = ".dll"
-
-    if ext == ".ex_":
+    elif ext == ".ex_":
         ext = ".exe"
+    elif ext == ".sy_":
+        ext = ".sys"
+    elif ext == ".db_":
+        ext = ".dbg"
+    elif ext == ".ptr":
+        ext = None  # common; allow all
 
-    if ext == ".ptr":
-        # Don't warn on this guy, it's commonly requested
-        ext = None
-
-    if ext not in [None, ".exe", ".pdb", ".sys", ".dll", ".snupkg"]:
+    if ext not in (None, *RECOGNIZED_EXTS):
         logger.warning(
             "Path '%s' doesn't have a recognized file extension (%s)", path, ext
         )
-        ext = None
+        return {}
 
-    target_upstreams = []
+    collected = {}
 
-    for upstream in upstreams:
-        extensions = upstream.get("extensions", [])
+    for upstream_name, upstream in all_upstreams.items():
+        upstream_cachable = not upstream.get("nocache", False)
+        if upstream_cachable != cachable:
+            continue
+        exts = upstream.get("extensions", [])
+        if ext is None or not exts or ext in exts:
+            collected[upstream_name] = upstream
 
-        include = False
-        if ext is None or not extensions:
-            include = True
-        elif ext in upstream["extensions"]:
-            include = True
-
-        if include:
-            target_upstreams.append(upstream)
-
-    return target_upstreams
+    return collected
 
 
 def is_blacklisted_path(path: str) -> bool:
     for part in substring_blacklist:
         if part in path:
             logger.debug(
-                "Path '%s' rejected, matched '%s' in substring blacklist", path, part
+                "Path '%s' rejected; matched substring blacklist '%s'", path, part
             )
             return True
-
     for suffix in suffix_blacklist:
         if path.endswith(suffix):
-            logger.debug(
-                "Path '%s' rejected, ends with '%s' in suffix blacklist", path, suffix
-            )
+            logger.debug("Path '%s' rejected; endswith blacklist '%s'", path, suffix)
             return True
-
-    file = path.split("/")[1]
-
-    if file in first_path_component_blacklist:
+    file0 = path.split("/")[1] if "/" in path else path
+    if file0 in first_path_component_blacklist:
         logger.debug(
-            "Path '%s' rejected, first path component '%s' in blacklist", path, file
+            "Path '%s' rejected; first component '%s' in blacklist", path, file0
         )
         return True
-
     return False
+
+
+def _client_passthrough_headers(request: Request, upstream_cfg: dict) -> Dict[str, str]:
+    # Keep minimal; these servers are picky
+    out: Dict[str, str] = {}
+    # SymbolChecksum handling
+    if "symbolchecksum" in request.headers:
+        out["SymbolChecksum"] = request.headers["symbolchecksum"]
+    elif upstream_cfg.get("requires_symbolchecksum", False):
+        out["SymbolChecksum"] = "invalid"
+    # (Intentionally not forwarding If-None-Match/If-Modified-Since upstream)
+    return out
+
+
+def _build_client_headers(
+    etag: Optional[str], last_modified: Optional[str], content_length: Optional[int]
+) -> Dict[str, str]:
+    h: Dict[str, str] = {}
+    if etag:
+        h["ETag"] = etag
+    if last_modified:
+        h["Last-Modified"] = last_modified
+    if content_length is not None:
+        h["Content-Length"] = str(content_length)
+    h.setdefault("Content-Type", "application/octet-stream")
+    return h
+
+
+def _content_length(resp: aiohttp.ClientResponse):
+    encoding: Optional[str] = resp.headers.get("Content-Encoding", None)
+    length: Optional[str] = resp.headers.get("Content-Length", None)
+
+    if encoding is not None:
+        return None
+
+    if length is None:
+        return None
+
+    try:
+        return int(length)
+    except ValueError:
+        return None
+
+
+async def empty_body() -> AsyncGenerator[bytes, None]:
+    if False:
+        yield b""
+
+
+async def _close_response(resp: Optional[aiohttp.ClientResponse]):
+    if resp is None:
+        return
+    try:
+        resp.release()
+    except Exception:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+class CachePump:
+    """
+    Reads upstream -> writes to cache (writer) -> optionally fans out to a single client via a queue.
+    Never blocks on the client. If the client is slow or disconnects, we detach it but continue
+    caching to completion, then commit() under shield.
+    """
+
+    __slots__ = ("resp", "writer", "read_chunk", "q", "client_alive", "lock", "task")
+
+    def __init__(
+        self, resp: aiohttp.ClientResponse, writer, lock: SingleFlight, read_chunk: int
+    ):
+        self.resp = resp
+        self.writer = writer
+        self.read_chunk = read_chunk
+        self.q: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        self.lock: SingleFlight = lock
+        self.client_alive: Optional[bool] = True
+
+    async def start(self):
+        self.task = asyncio.create_task(self._run())
+        await self.lock.transfer(self.task)
+        await app.state.task_manager.submit_task(self.task)
+        return self
+
+    async def _run(self):
+        try:
+            async for chunk in self.resp.content.iter_chunked(self.read_chunk):
+                if self.writer is not None:
+                    await self.writer.write(chunk)
+                if self.client_alive:
+                    await self.q.put(chunk)
+                elif self.client_alive == False:
+                    # Client went away, but we can continue the caching
+                    # process. Drain the queue entirely, once, to release
+                    # memory.
+                    self.q.shutdown(immediate=True)
+                    self.client_alive = None
+
+            if self.writer is not None:
+                await self.writer.commit()
+        except Exception:
+            logging.exception("Unrecognized exception")
+            if self.writer is not None:
+                try:
+                    await self.writer.abort()
+                except Exception:
+                    pass
+            raise
+        finally:
+            if self.lock:
+                await self.lock.release()
+            if self.client_alive:
+                # Normal completion: signal EOF to client
+                await self.q.put(None)
+            # Always release the upstream response
+            await _close_response(self.resp)
+
+    async def body(self):
+        try:
+            while True:
+                item = await self.q.get()
+                if item is None:
+                    break
+                yield item
+        except asyncio.CancelledError:
+            # Client went away; detach but keep caching
+            self.client_alive = False
+            # Don't cancel the pump task; it will finish and commit().
+            raise
+
+
+# =====================
+# Startup / shutdown
+# =====================
+
+
+class FilteredAccessLog(logging.Filter):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        assert isinstance(record.args, tuple)
+        filter_match = (record.args[4], record.args[2])
+        if filter_match in ignore_access:
+            return False
+        return True
+
+
+class BackgroundTaskManager:
+    def __init__(self):
+        self.task_queue: asyncio.Queue[asyncio.Task] = asyncio.Queue()
+        self.active_tasks: Set[asyncio.Task] = set()
+        self.processor_task: Optional[asyncio.Task] = None
+        self.running: bool = False
+
+    async def start(self):
+        self.running = True
+        self.processor_task = asyncio.create_task(self._processor())
+
+    async def stop(self):
+        self.running = False
+        if self.processor_task is not None:
+            self.processor_task.cancel()
+        self.task_queue.shutdown(True)
+
+    async def submit_task(self, coro):
+        await self.task_queue.put(coro)
+
+    async def _pull_available_tasks(self, blocking: bool):
+        # No active tasks, wait for new ones
+        if blocking:
+            coro = await self.task_queue.get()
+        else:
+            try:
+                coro = await self.task_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return False
+        assert coro is not None
+        self.active_tasks.add(coro)
+        self.task_queue.task_done()
+        return True
+
+    async def _processor(self):
+        while self.running:
+            try:
+                # Always try to get new tasks first
+                while await self._pull_available_tasks(blocking=False):
+                    pass
+
+                if self.active_tasks:
+                    # Wait for any active task to complete
+                    done, pending = await asyncio.wait(
+                        self.active_tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=0.1,  # Short timeout to check for new tasks
+                    )
+
+                    # Remove completed tasks
+                    self.active_tasks -= done
+
+                    # Process results
+                    for task in done:
+                        try:
+                            await task
+                        except Exception as e:
+                            logger.exception(f"Task failed: {e}")
+                else:
+                    await self._pull_available_tasks(blocking=True)
+
+            except asyncio.CancelledError:
+                break
+
+
+@app.on_event("startup")
+async def _setup_logging():
+    install_queue_logging(microseconds=False)
+
+
+@app.on_event("startup")
+async def _warm_streaming_path():
+    """
+    Warm up the StreamingResponse path so we don't have imports that get
+    delayed until our first StreamingResponse.
+    """
+    # Touch Starlette helpers that pull in anyio under the hood
+    from starlette import concurrency as _c  # noqa: F401
+    import anyio  # noqa: F401
+    import anyio._backends._asyncio as _backend  # noqa: F401
+    import array  # noqa: F401
+
+
+@app.on_event("startup")
+async def startup_event():
+    global upstreams, substring_blacklist, suffix_blacklist, first_path_component_blacklist
+    global ignore_access, cache_backend_type, cache_mode, cache_ttl
+
+    logger.debug("Running startup event")
+
+    with open("config/main.toml", "rb") as f:
+        main_cfg = tomllib.load(f)
+    with open("config/upstreams.toml", "rb") as f:
+        ups_cfg = tomllib.load(f)
+    with open("config/blacklist.toml", "rb") as f:
+        bl_cfg = tomllib.load(f)
+
+    # Upstreams
+    upstreams = {u["name"]: u for u in ups_cfg["upstream"]}
+
+    # Blacklists
+    substring_blacklist = bl_cfg["substring_blacklist"].get("names", [])
+    suffix_blacklist = bl_cfg["suffix_blacklist"].get("names", [])
+    first_path_component_blacklist = bl_cfg["first_path_component_blacklist"].get(
+        "names", []
+    )
+
+    # TTL values
+    for key, value in main_cfg.get("cache_ttl", {}).items():
+        try:
+            cache_ttl[int(key)] = int(value)
+        except ValueError:
+            logger.exception("Unparseable cache TTL value %s:%s", key, value)
+
+    # HTTP client
+    timeouts = aiohttp.ClientTimeout(sock_connect=5.0, sock_read=20.0)
+    app.state.session_ssl_ctx = ssl.create_default_context()
+    app.state.session_connector = aiohttp.TCPConnector(
+        ssl=app.state.session_ssl_ctx,
+        use_dns_cache=True,
+        ttl_dns_cache=300,
+        keepalive_timeout=30,
+        limit_per_host=100,
+        limit=0,
+        family=socket.AF_INET,
+        happy_eyeballs_delay=None,
+        enable_cleanup_closed=True,
+    )
+    app.state.session = aiohttp.ClientSession(
+        connector=app.state.session_connector, timeout=timeouts
+    )
+
+    # Filter out some noisy paths
+    for filter_spec in main_cfg["log_filters"]["ignore_access"]:
+        ignore_access.add((int(filter_spec["status"]), str(filter_spec["path"])))
+    logging.getLogger("uvicorn.access").addFilter(FilteredAccessLog())
+
+    # Cache backend + mode
+    cache_cfg = main_cfg.get("cache", {})
+    cache_backend_type = cache_cfg.get("type", "disk")
+    cache_mode = cache_cfg.get("mode", "standalone")  # "standalone" | "nginx"
+
+    cache_path = cache_cfg.get("path")
+    if not cache_path:
+        raise ValueError("cache.path must be set in config/main.toml")
+
+    if cache_backend_type == "sqlite":
+        app.state.cache = await AsyncSqliteCache(
+            cache_path, **dict(main_cfg.get("sqlite", {}))
+        ).start()
+    else:
+        raise ValueError(f"Unknown cache backend type: {cache_backend_type}")
+
+    app.state.task_manager = BackgroundTaskManager()
+    await app.state.task_manager.start()
+
+    logger.debug("Startup event complete")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await app.state.task_manager.stop()
+    await app.state.session.close()
+    await app.state.cache.close()
+    shutdown_queue_logging()
+
+
+# =====================
+# Core streaming logic
+# =====================
+
+Body = AsyncGenerator[bytes, None]
+Result = Tuple[int, Dict[str, str], Body]
+
+
+async def _cache_hit_result(metadata, cache, method: str) -> Optional[Result]:
+    """
+    Return a Result if we can satisfy from cache; else None.
+    Honors cache_mode: X-Accel-Redirect only when mode == 'nginx'.
+    """
+    if metadata is None:
+        return None
+
+    if metadata.status_code != 200:
+        return (metadata.status_code, {}, empty_body())
+
+    headers = _build_client_headers(
+        metadata.etag, metadata.last_modified, metadata.size
+    )
+
+    # nginx offload first (only in nginx mode)
+    if cache_mode == "nginx":
+        redirect_path = await cache.get_nginx_redirect_path(metadata)
+        if redirect_path:
+            # Let nginx fill in content length -- *we* aren't giving back
+            # a body here.
+            del headers["Content-Length"]
+            headers["X-Accel-Redirect"] = redirect_path
+            return (200, headers, empty_body())
+
+    if method == "HEAD":
+        return (200, headers, empty_body())
+
+    stream = await cache.get_streaming(metadata.key)
+    if stream:
+
+        async def body():
+            async for chunk in stream:
+                yield chunk
+
+        return (200, headers, body())
+
+    return None
+
+
+def _cache_key_from_upstream_path(upstream_cfg: dict, path: str) -> CacheKey:
+    base = upstream_cfg["base_url"].rstrip("/")
+    url = f"{base}{path}"
+    return make_cache_key(upstream_name=upstream_cfg["name"], full_url=url)
+
+
+async def _attempt_upstream(
+    session: aiohttp.ClientSession,
+    request: Request,
+    cache,
+    key: CacheKey,
+    method: str,
+) -> Optional[Result]:
+    """
+    Try one upstream:
+    - If cacheable and hit: return cache result.
+    - Else request upstream; on 200, write-while-send via open_write_stream; on 4xx, set negative cache.
+    Returns None on network failure (so hedger can try others).
+    """
+    allow_cache = cache is not None
+
+    assert key.upstream_name is not None
+    assert key.full_url is not None
+
+    # TODO: Work out how to get rid of this
+    upstream_cfg = upstreams.get(key.upstream_name, {})
+
+    single = UDSSingleFlight(key) if allow_cache else NoOpSingleFlight(key)
+
+    # We don't need to do an initial cache lookup right here, because we
+    # already did a mass lookup earlier. We only need to worry about multiple
+    # clients trying to fill the cache for the same key, so we do need to check
+    # within the lock.
+
+    async with single.locked(timeout=30.0):
+        # Re-check the cache, we may have raced with another "first hit" and lost
+        if allow_cache:
+            metadata = await cache.get_metadata(key)
+            hit = await _cache_hit_result(metadata, cache, method)
+            if hit is not None:
+                # Release the lock ASAP, we probably have other waiters
+                await single.release()
+                return hit
+
+        logger.debug("Cache miss for %s", key.full_url)
+
+        # Upstream fetch
+        req_headers = _client_passthrough_headers(request, upstream_cfg)
+        resp: Optional[aiohttp.ClientResponse] = None
+        try:
+            resp = await session.request(method, key.full_url, headers=req_headers)
+            status = resp.status
+            etag = resp.headers.get("ETag")
+            last_mod = resp.headers.get("Last-Modified", _httpdate_now_gmt())
+            content_length = _content_length(resp)
+
+            # HEAD or 304 => header-only response; do not fill cache
+            if method == "HEAD" or status == 304:
+                headers = _build_client_headers(etag, last_mod, content_length)
+                await _close_response(resp)
+                return (status, headers, empty_body())
+
+            if status == 200:
+                headers = _build_client_headers(etag, last_mod, content_length)
+                writer = None
+                if allow_cache:
+                    writer = await cache.open_write_stream(
+                        key,
+                        status_code=200,
+                        etag=etag,
+                        last_modified=last_mod,
+                        ttl=cache_ttl.get(200, TTL_SUCCESS_DEFAULT),
+                    )
+
+                pump = await CachePump(resp, writer, single, READ_CHUNK).start()
+                return (200, headers, pump.body())
+
+            if allow_cache and 400 <= status < 500:
+                # Negative cache for 400-499 errors
+                await cache.set_negative_cache(
+                    key,
+                    status_code=status,
+                    ttl=cache_ttl.get(status, TTL_FAILURE_DEFAULT),
+                )
+
+            headers = _build_client_headers(etag, last_mod, content_length)
+            await _close_response(resp)
+            return (status, headers, empty_body())
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await _close_response(resp)
+            logger.exception("Upstream request to %s failed: %s", key.full_url, e)
+            return None
+
+
+def _maybe_cache_upstream(cache, upstream_name: str):
+    u = upstreams.get(upstream_name)
+    assert u is not None
+    if u.get("nocache", False):
+        return None
+    return cache
+
+
+async def _handle_upstream_group(
+    session: aiohttp.ClientSession,
+    request: Request,
+    cache,
+    keys: List[CacheKey],
+    method: str,
+) -> Optional[Result]:
+    """
+    Within a single group, try all upstreams at once.
+    Accept the first successful result.
+    If all attempts fail or return None, the tier fails -> try next tier.
+    """
+    if not keys:
+        return None
+
+    tasks: List[asyncio.Task] = []
+
+    async def attempt(key: CacheKey):
+        try:
+            assert key.upstream_name is not None
+            res = await _attempt_upstream(
+                session,
+                request,
+                _maybe_cache_upstream(cache, key.upstream_name),
+                key,
+                method,
+            )
+
+            # Any non-None result is a 'decisive' response (200, 4xx, etc.)
+            if res is not None and res[0] == 200:
+                return res
+
+            return None
+        except Exception as exc:
+            # Keep searching within tier
+            logger.exception("Unhandled exception")
+            return None
+
+    tasks = [asyncio.create_task(attempt(key)) for key in keys]
+
+    try:
+        for done_task in asyncio.as_completed(tasks):
+            resp = await done_task
+            if resp is None:
+                # Failed, try next completed task
+                continue
+            return resp
+        return None
+    finally:
+        remaining = [t for t in tasks if not t.done()]
+        for t in remaining:
+            t.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
+
+
+# =====================
+# Routes
+# =====================
 
 
 @app.head("/{path:path}")
 @app.get("/{path:path}")
 async def proxy(path: str, request: Request):
-    # Ensure path begins with exactly one forward slash
+    # Normalize path to exactly one leading '/'
     path = "/" + path.lstrip("/")
 
     if is_blacklisted_path(path):
-        logger.debug(f"Blacklisted: '{path}', rejecting with 404 response")
+        logger.debug("Blacklisted: '%s', rejecting with 404", path)
         return Response(status_code=404)
 
-    target_upstreams = choose_upstreams(path)
-    session = request.app.state.session  # We'll need to change this to aiohttp.ClientSession
-    cache = request.app.state.cache      # Our AsyncDiskCache instance
+    method = request.method.upper()
+    if method not in ("GET", "HEAD"):
+        return Response(status_code=405)
 
-    async def stream_from_upstream(upstream: Table):
-        """Try a single upstream, return (success, stream) tuple"""
+    session: aiohttp.ClientSession = request.app.state.session
+    cache = request.app.state.cache
 
-        stream = fetch_cached_or_live(
-            session,
-            cache,
-            upstream,
-            request.method,
-            path,
-            dict(request.headers)
-        )
-
-        try:
-            chunk, status, headers = await anext(stream)
-            if status in (200, 304):
-                return True, status, headers, chunk, stream
-        except StopAsyncIteration:
-            pass
-
-        return False, None, None, None, None
-
-    # Create tasks for all upstreams
-    tasks = [
-        asyncio.create_task(stream_from_upstream(upstream))
-        for upstream in target_upstreams
+    # Collect cachable upstreams and their corresponding cache keys
+    cache_upstreams = upstreams_for_path(upstreams, path, True)
+    cache_keys = [
+        _cache_key_from_upstream_path(u, path) for u in cache_upstreams.values()
     ]
 
-    try:
-        # As each task completes, check if it's successful
-        for done_task in asyncio.as_completed(tasks):
-            success, status_code, response_headers, first_chunk, stream = await done_task
+    # Get metadata for all cachable upstreams
+    metas = await cache.get_many_metadata(cache_keys)
+    if metas:
+        logger.debug(
+            "Found cache metadata from upstreams %s for path %s",
+            list([m.key.upstream_name for m in metas]),
+            path,
+        )
+    for meta in metas:
+        hit = await _cache_hit_result(meta, cache, method)
 
-            if success:
-                for task in tasks:
-                    if task is not done_task and not task.done():
-                        task.cancel()
+        # Check if this is either a positive or negative cache hit
+        if hit is not None:
 
-                async def response_stream():
-                    yield first_chunk
-                    async for chunk, _, _ in stream:
-                        yield chunk
-
+            # Found a hit, check if it's a positive hit
+            status, headers, body_gen = hit
+            if status == 200:
+                # Positive hit, finish out our response immediately
                 return StreamingResponse(
-                    response_stream(),
-                    status_code=status_code,
-                    media_type=response_headers.get('Content-Type', 'application/octet-stream'),
-                    headers=response_headers
+                    body_gen,
+                    status_code=status,
+                    headers=headers,
+                    media_type=headers.get("Content-Type", "application/octet-stream"),
                 )
 
-    finally:
-        # Cancel any remaining tasks
-        remaining = [t for t in tasks if not t.done()]
-        if remaining:
-            for task in remaining:
-                task.cancel()
-            await asyncio.gather(*remaining, return_exceptions=True)
+            # Negative hit, we can exclude this from remaining upstreams
+            del cache_upstreams[meta.key.upstream_name]
 
+    # Filter out cache keys which correspond to upstreams we've rejected
+    cache_keys = list(filter(lambda x: x.upstream_name in cache_upstreams, cache_keys))
+
+    # We missed or had negative hits for all cachable upstreams, now collect
+    # the uncachable ones and group them for tiered querying
+    nocache_upstreams = upstreams_for_path(upstreams, path, False)
+
+    # Append the cache keys for upstreams that don't allow caching
+    cache_keys += [
+        _cache_key_from_upstream_path(u, path) for u in nocache_upstreams.values()
+    ]
+
+    if cache_keys:
+        logger.debug(
+            "No positive cache hits, asking remaining upstreams %s for path %s",
+            list([k.upstream_name for k in cache_keys]),
+            path,
+        )
+
+    # For all remaining cache keys, we now try an HTTP request to the upstream
+    # for that key
+    result = await _handle_upstream_group(session, request, cache, cache_keys, method)
+    if result is not None:
+        status, headers, body_gen = result
+        return StreamingResponse(
+            body_gen,
+            status_code=status,
+            headers=headers,
+            media_type=headers.get("Content-Type", "application/octet-stream"),
+        )
+
+    logger.debug("All upstreams exhausted for %s", path)
     return Response(status_code=404)
 
 
 def main():
-    main_config = TOMLFile("config/main.toml").read()
+    with open("config/main.toml", "rb") as fd:
+        main_config = tomllib.load(fd)
     uvicorn.run("symsrv:app", **main_config["uvicorn"])
 
 

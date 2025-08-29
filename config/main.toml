@@ -3,17 +3,33 @@
 uds = "/srv/cache/ntsymbols/run/symsrv.sock"
 #host = "0.0.0.0"
 #port = 80
-workers = 8
+workers = 4
 proxy_headers = true
 forwarded_allow_ips = "*"
 http = "httptools"
 ws = "websockets"
 log_config = "config/log_config.yml"
 
-# Local disk cache configuration
-[disk_cache]
+[cache]
+# Cache backend selection
+# Currently the only option is "sqlite", which uses SQLite for cache metadata
+# and a filesystem subdirectory tree for data storage
+type = "sqlite"
+
+# Options:
+#   "nginx" - use X-Accel-Redirect, offloading cache hits to nginx for data
+#             transfer, including support for ranges
+#   "standalone" - stream cache hit data ourselves
+mode = "nginx"
 path = "/srv/cache/ntsymbols/data"
-size = "64GB"
+size = "512GB"
+
+[sqlite]
+# Update interval in seconds for batch updates (e.g. access time, statistics)
+batch_update_interval = 30
+
+# Number of connections in the pool, per worker
+connection_pool_size_per_worker = 4
 
 [log_filters]
 ignore_access = [
