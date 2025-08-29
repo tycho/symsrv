@@ -14,6 +14,8 @@ import hashlib
 
 logger = logging.getLogger("uvicorn.error")
 
+CHUNK_SIZE = 4 * 1024 * 1024
+
 @dataclass
 class CacheMetadata:
     created_at: float
@@ -244,7 +246,7 @@ class AsyncDiskCache:
         # Open the data file and stream it
         async def stream_generator():
             async with aiofiles.open(data_path, 'rb') as f:
-                while chunk := await f.read(8192):  # 8KB chunks
+                while chunk := await f.read(CHUNK_SIZE):
                     yield chunk
 
         return stream_generator()

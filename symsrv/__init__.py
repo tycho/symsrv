@@ -31,7 +31,6 @@ logger = logging.getLogger("uvicorn.error")
 TTL_SUCCESS_DEFAULT = 8 * 60 * 60  # 8 hours
 TTL_FAILURE_DEFAULT = 1 * 60 * 60  # 1 hour
 
-CHUNK_SIZE = 256 * 1024
 PROFILING_ENABLED = False
 
 cache_ttl: Dict[int, int] = {}
