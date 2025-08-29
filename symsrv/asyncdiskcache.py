@@ -23,6 +23,17 @@ class CacheMetadata:
     tags: Dict[str, Any]
     size: int = 0  # File size in bytes
 
+
+async def _remove_files(files: list[Path]) -> None:
+    for filepath in files:
+        if not filepath.is_file():
+            continue
+        try:
+            await aiofiles.os.unlink(filepath)
+        except (FileNotFoundError, OSError) as e:
+            logger.error(f"Could not remove {filepath}: {e}")
+
+
 class AsyncDiskCache:
     _cleanup_task_created = False
 
@@ -209,7 +220,7 @@ class AsyncDiskCache:
         async with aiofiles.open(meta_path, 'w') as f:
             await f.write(json.dumps(vars(metadata)))
 
-    async def get_nginx_redirect_path(self, key: str) -> str:
+    async def get_nginx_redirect_path(self, key: str) -> Optional[str]:
         """
         Get the NGINX X-Accel-Redirect response.
 
@@ -310,21 +321,12 @@ class AsyncDiskCache:
             await asyncio.sleep(interval)
         logger.info("Cleanup task exiting")
 
-    async def _remove_files(self, files: list[Path]) -> None:
-        for filepath in files:
-            if not filepath.is_file():
-                continue
-            try:
-                await aiofiles.os.unlink(filepath)
-            except (FileNotFoundError, OSError) as e:
-                logger.error(f"Could not remove {filepath}: {e}")
-
     async def _cleanup_invalid_metadata(self) -> None:
         """Clean up items with invalid metadata from the cache."""
         now = time.time()
 
         # Process files in smaller batches
-        batch_size = 50  # Reduced from previous 100
+        batch_size = 200
 
         try:
             # Check for data files with missing metadata
@@ -332,18 +334,21 @@ class AsyncDiskCache:
             logger.info(f"Found {len(data_files)} data files, checking for missing metadata...")
             for i in range(0, len(data_files), batch_size):
                 batch = data_files[i:i + batch_size]
-                # Process one file at a time instead of gathering
+                remove_queue = []
+
                 for data_path in batch:
                     try:
                         meta_path = self._get_paths_from_hash(data_path.stem)[1]
 
                         if not meta_path.is_file():
                             logger.info(f"Removing cache entry with missing metadata {data_path}")
-                            await self._remove_files([data_path, meta_path])
+                            remove_queue.extend([data_path, meta_path])
 
                     except (FileNotFoundError, OSError) as e:
                         logger.error(f"Error processing cache file {data_path}: {e}")
                         continue
+
+                await _remove_files(remove_queue)
 
                 # Add a small delay between batches
                 await asyncio.sleep(0.01)
@@ -357,7 +362,8 @@ class AsyncDiskCache:
             logger.info(f"Found {len(meta_files)} cache files, checking for corrupt metadata...")
             for i in range(0, len(meta_files), batch_size):
                 batch = meta_files[i:i + batch_size]
-                # Process one file at a time instead of gathering
+                remove_queue = []
+
                 for meta_path in batch:
                     try:
                         async with aiofiles.open(meta_path, 'r') as f:
@@ -384,11 +390,13 @@ class AsyncDiskCache:
                                     remove = True
 
                             if remove:
-                                await self._remove_files([data_path, meta_path])
+                                remove_queue.extend([data_path, meta_path])
 
                     except (FileNotFoundError, OSError) as e:
                         logger.error(f"Error processing cache file {meta_path}: {e}")
                         continue
+
+                await _remove_files(remove_queue)
 
                 # Add a small delay between batches
                 await asyncio.sleep(0.01)
@@ -401,7 +409,7 @@ class AsyncDiskCache:
         now = time.time()
 
         # Process files in smaller batches
-        batch_size = 50  # Reduced from previous 100
+        batch_size = 200
 
         try:
             # Get list of files first
@@ -412,7 +420,8 @@ class AsyncDiskCache:
 
             for i in range(0, len(meta_files), batch_size):
                 batch = meta_files[i:i + batch_size]
-                # Process one file at a time instead of gathering
+                remove_queue = []
+
                 for meta_path in batch:
                     try:
                         async with aiofiles.open(meta_path, 'r') as f:
@@ -431,10 +440,12 @@ class AsyncDiskCache:
                             if create_expired and modify_expired:
                                 data_path = self._get_paths_from_hash(meta_path.stem)[0]
                                 num_removed += 1
-                                await self._remove_files([data_path, meta_path])
+                                remove_queue.extend([data_path, meta_path])
                     except (FileNotFoundError, json.JSONDecodeError, TypeError, OSError) as e:
                         logger.error(f"Error processing cache file {meta_path}: {e}")
                         continue
+
+                await _remove_files(remove_queue)
 
                 # Add a small delay between batches
                 await asyncio.sleep(0.01)
