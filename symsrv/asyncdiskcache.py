@@ -325,7 +325,7 @@ class AsyncDiskCache:
         batch_size = 50  # Reduced from previous 100
 
         try:
-            # Check for metadata with invalid JSON or missing data
+            # Check for data files with missing metadata
             data_files = list(filter(lambda x: x.is_file(), list(self.data_dir.rglob("*"))))
             logger.info(f"Found {len(data_files)} data files, checking for missing metadata...")
             for i in range(0, len(data_files), batch_size):
@@ -350,7 +350,7 @@ class AsyncDiskCache:
             logger.error(f"Error during missing metadata sweep: {e}", exc_info=True)
 
         try:
-            # Check for metadata with invalid JSON or missing data
+            # Check for metadata corruption
             meta_files = list(self.metadata_dir.rglob("*.json"))
             logger.info(f"Found {len(meta_files)} cache files, checking for corrupt metadata...")
             for i in range(0, len(meta_files), batch_size):
