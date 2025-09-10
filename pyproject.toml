@@ -1,6 +1,6 @@
 [project]
 name = "symsrv"
-version = "0.1.0"
+version = "1.0.0"
 description = "Python symbol server caching proxy"
 authors = [
 	{ name = "Steven Noonan", email = "steven@uplinklabs.net" }
