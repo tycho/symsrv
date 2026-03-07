@@ -104,6 +104,7 @@ class AioSqlitePool:
     async def _new_connection(self) -> aiosqlite.Connection:
         conn = await aiosqlite.connect(self._db, uri=self._uri, **self._connect_kwargs)
         await conn.execute("PRAGMA journal_mode = WAL;")
+        await conn.execute("PRAGMA page_size = 65536;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
         await conn.execute("PRAGMA cache_size = -8000;")  # 8MB per connection
         await conn.execute("PRAGMA temp_store = MEMORY;")
