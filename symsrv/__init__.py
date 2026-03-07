@@ -575,10 +575,12 @@ async def _attempt_upstream(
 
             if allow_cache and 400 <= status < 500:
                 # Negative cache for 400-499 errors
-                await cache.set_negative_cache(
-                    key,
-                    status_code=status,
-                    ttl=cache_ttl.get(status, TTL_FAILURE_DEFAULT),
+                await asyncio.shield(
+                    cache.set_negative_cache(
+                        key,
+                        status_code=status,
+                        ttl=cache_ttl.get(status, TTL_FAILURE_DEFAULT),
+                    )
                 )
 
             headers = _build_client_headers(etag, last_mod, content_length)
