@@ -112,6 +112,7 @@ class AioSqlitePool:
         if self._init:
             await self._init(conn)
         await conn.commit()
+        assert not conn.in_transaction
         self._all_conns.add(conn)
         return conn
 
@@ -143,6 +144,7 @@ class AioSqlitePool:
         try:
             yield conn
         finally:
+            assert not conn.in_transaction
             # If pool is closed, actually close the connection
             if self._closed:
                 await self._really_close(conn)
@@ -232,7 +234,7 @@ class _SqliteStreamingWriter:
         now = time.time()
 
         # Single transaction to upsert cache row
-        async with self._cache.connection_pool().acquire() as conn:
+        async with self._cache.connection_pool().transaction(write=True) as conn:
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO cache_entries (
@@ -260,7 +262,6 @@ class _SqliteStreamingWriter:
                     content_sha256,
                 ),
             )
-            await conn.commit()
 
     async def abort(self) -> None:
         if self._closed:
@@ -564,7 +565,7 @@ class AsyncSqliteCache:
     async def get_metadata(self, key: CacheKey) -> Optional[CacheMetadata]:
         """Retrieve metadata for a cached item if it exists and is not expired."""
         try:
-            async with self.connection_pool().acquire() as conn:
+            async with self.connection_pool().transaction(write=False) as conn:
                 rows = await conn.execute_fetchall(
                     """
                     SELECT url, status_code, created_at, accessed_at, ttl,
@@ -667,7 +668,7 @@ class AsyncSqliteCache:
         # Store metadata in database
         now = time.time()
         try:
-            async with self.connection_pool().acquire() as conn:
+            async with self.connection_pool().transaction(write=True) as conn:
                 await conn.execute(
                     """
                     INSERT OR REPLACE INTO cache_entries (
@@ -690,7 +691,6 @@ class AsyncSqliteCache:
                         None,
                     ),
                 )
-                await conn.commit()
         except Exception as e:
             logger.error(f"Error storing negative cache entry for {key.full_url}: {e}")
             raise
@@ -730,7 +730,7 @@ class AsyncSqliteCache:
     async def get_streaming(self, key: CacheKey) -> Optional[AsyncIterator[bytes]]:
         """Retrieve data from cache as an async stream."""
         try:
-            async with self.connection_pool().acquire() as conn:
+            async with self.connection_pool().transaction(write=False) as conn:
                 rows = await conn.execute_fetchall(
                     """
                     SELECT status_code, created_at, accessed_at, ttl
@@ -778,7 +778,7 @@ class AsyncSqliteCache:
     async def delete(self, key: CacheKey) -> None:
         """Delete a cached item and its metadata."""
         try:
-            async with self.connection_pool().acquire() as conn:
+            async with self.connection_pool().transaction(write=True) as conn:
                 await conn.execute(
                     "DELETE FROM cache_entries WHERE cache_key = ?", (key.hash_key_raw,)
                 )
@@ -811,10 +811,10 @@ class AsyncSqliteCache:
                 # Batch update access times
                 await conn.executemany(
                     """
-                                       UPDATE cache_entries
-                                       SET accessed_at = ?
-                                       WHERE cache_key = ?
-                                       """,
+                    UPDATE cache_entries
+                    SET accessed_at = ?
+                    WHERE cache_key = ?
+                    """,
                     [
                         (timestamp, cache_key)
                         for cache_key, timestamp in updates.items()
@@ -861,7 +861,7 @@ class AsyncSqliteCache:
                         continue
                     key_data_pairs.append((cache_key.hash_key_raw, str(data_path)))
 
-                async with self.connection_pool().acquire() as conn:
+                async with self.connection_pool().transaction(write=False) as conn:
                     await conn.execute(
                         """
                         CREATE TEMP TABLE IF NOT EXISTS _to_check(
@@ -882,7 +882,6 @@ class AsyncSqliteCache:
                     WHERE c.cache_key IS NULL
                     """
                     rows = await conn.execute_fetchall(sql)
-                    await conn.commit()
 
                 if not rows:
                     continue
@@ -912,7 +911,7 @@ class AsyncSqliteCache:
         batch_size = 500
         try:
             bad_keys = []
-            async with self.connection_pool().acquire() as conn:
+            async with self.connection_pool().transaction(write=False) as conn:
                 sql = """
                 SELECT cache_key FROM cache_entries WHERE content_length > 0
                 """
@@ -934,7 +933,6 @@ class AsyncSqliteCache:
                                     bad_keys.append((cache_key.hash_key_raw,))
 
                         await asyncio.sleep(0.1)
-                await conn.commit()
 
             if bad_keys:
                 for i in range(0, len(bad_keys), batch_size):
@@ -944,7 +942,6 @@ class AsyncSqliteCache:
                         DELETE FROM cache_entries WHERE cache_key IN (?)
                         """
                         await conn.executemany(sql, batch)
-                        await conn.commit()
                     await asyncio.sleep(0.1)
 
                 logger.info("Removed %d entries with missing data", len(bad_keys))
@@ -964,7 +961,7 @@ class AsyncSqliteCache:
 
         try:
             while True:
-                async with self.connection_pool().acquire() as conn:
+                async with self.connection_pool().transaction(write=True) as conn:
                     sql = """
                     WITH expired AS (
                         SELECT rowid FROM cache_entries
@@ -977,7 +974,6 @@ class AsyncSqliteCache:
                     RETURNING cache_key
                     """
                     rows = await conn.execute_fetchall(sql, (now, now, batch_size))
-                    await conn.commit()
 
                 if rows is None:
                     rows = []
@@ -1041,9 +1037,8 @@ class AsyncSqliteCache:
             except ValueError as e:
                 if _is_aiosqlite_valueerror(e):
                     logger.error("SQLite connection died during access time update")
-                else:
-                    logger.exception("Error during access time update: %s", e)
-                break
+                    break
+                logger.exception("Error during access time update: %s", e)
             except Exception as e:
                 logger.exception("Error during access time update: %s", e)
 
