@@ -533,7 +533,9 @@ async def _attempt_upstream(
     async with single.locked(timeout=30.0):
         # Re-check the cache, we may have raced with another "first hit" and lost
         if allow_cache:
-            metadata = await cache.get_metadata(key)
+            metadata = await asyncio.shield(
+                cache.get_metadata(key)
+            )
             hit = await _cache_hit_result(metadata, cache, method)
             if hit is not None:
                 # Release the lock ASAP, we probably have other waiters
