@@ -84,8 +84,10 @@ class AioSqlitePool:
 
     async def start(self) -> "AioSqlitePool":
         for _ in range(self._min_size):
-            conn = await self._new_connection()
-            await self._queue.put(conn)
+            async with self._total_lock:
+                self._total += 1
+                conn = await self._new_connection()
+                await self._queue.put(conn)
         return self
 
     async def close(self) -> None:
