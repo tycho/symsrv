@@ -25,6 +25,9 @@ path = "/srv/cache/ntsymbols/data"
 size = "512GB"
 
 [sqlite]
+# Optional: set a custom path for the DB storage, otherwise it will be in {cache.path}/db
+#db_path = "/srv/symsrv-db"
+
 # Update interval in seconds for batch updates (e.g. access time, statistics)
 batch_update_interval = 30
 

@@ -302,6 +302,7 @@ class AsyncSqliteCache:
     def __init__(
         self,
         cache_dir: str,
+        db_path: Optional[str] = None,
         default_ttl: Optional[float] = None,
         connection_pool_size_per_worker: int = 3,
         batch_update_interval: float = 30,
@@ -320,10 +321,19 @@ class AsyncSqliteCache:
             subdirectory_depth: Number of subdirectory levels for data files
             subdirectory_width: Number of hex characters per subdirectory level
         """
+        if db_path is None:
+            db_path = cache_dir
         self.cache_dir = Path(cache_dir)
-        self.db_path = self.cache_dir / "metadata.db"
-        self.data_dir = self.cache_dir / "data"
-        self.temp_dir = self.cache_dir / "temp"
+        self.db_dir = Path(db_path) / "db"
+
+        # Create directories if they don't already exist
+        os.makedirs(self.cache_dir / "storage" / "data", exist_ok=True)
+        os.makedirs(self.cache_dir / "storage" / "temp", exist_ok=True)
+        os.makedirs(self.db_dir, exist_ok=True)
+
+        self.db_path = self.db_dir / "metadata.db"
+        self.data_dir = self.cache_dir / "storage" / "data"
+        self.temp_dir = self.cache_dir / "storage" / "temp"
         self.default_ttl = float(default_ttl if default_ttl else 8 * 60 * 60)
         self.connection_pool_size = int(connection_pool_size_per_worker)
         self.batch_update_interval = float(batch_update_interval)
