@@ -455,7 +455,6 @@ class AsyncSqliteCache:
         );
         CREATE INDEX IF NOT EXISTS idx_upstream_status ON cache_entries(upstream_name, status_code);
         CREATE INDEX IF NOT EXISTS idx_accessed_at ON cache_entries(accessed_at);
-        CREATE INDEX IF NOT EXISTS idx_cache_key ON cache_entries(cache_key);
         """
 
         # Use a temporary connection for schema setup
