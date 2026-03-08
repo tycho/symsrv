@@ -462,7 +462,7 @@ class AsyncSqliteCache:
             await conn.executescript(schema_sql)
             await conn.commit()
 
-    def _get_subdirectory_path(self, key_hash: str, base_dir: Path) -> Path:
+    def _get_subdirectory_path(self, key_hash: str, base_dir: Path, write: bool) -> Path:
         """Creates a subdirectory path based on the key hash."""
         w = self.subdirectory_width
         d = self.subdirectory_depth
@@ -471,13 +471,13 @@ class AsyncSqliteCache:
         path = base_dir.joinpath(*(key_hash[i : i + w] for i in range(0, d * w, w)))
 
         # Create if it doesn't exist
-        if not path.is_dir():
+        if write:
             path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def _get_data_file_path(self, key: CacheKey) -> Path:
+    def _get_data_file_path(self, key: CacheKey, write: bool = False) -> Path:
         """Get the data file path for a given cache key."""
-        data_subdir = self._get_subdirectory_path(key.hash_key, self.data_dir)
+        data_subdir = self._get_subdirectory_path(key.hash_key, self.data_dir, write=write)
         return data_subdir / key.hash_key
 
     async def _parse_http_date(self, http_date: Optional[str]) -> Optional[float]:
@@ -634,15 +634,10 @@ class AsyncSqliteCache:
             )
 
         # Ensure directories + compute final paths
-        data_path = (
-            self._get_subdirectory_path(key.hash_key, self.data_dir) / key.hash_key
-        )
-        data_path.parent.mkdir(parents=True, exist_ok=True)
-
+        data_path = self._get_data_file_path(key, write=True)
         tmp = self.temp_dir / (
             key.hash_key + f".tmp-{os.getpid()}-{int(time.time() * 1e6)}"
         )
-        tmp.parent.mkdir(parents=True, exist_ok=True)
 
         f = await aiofiles.open(tmp, "wb", buffering=0)
 
