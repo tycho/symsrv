@@ -181,7 +181,7 @@ class AioSqlitePool:
                     await conn.execute("BEGIN;")
                 yield conn
                 await conn.commit()
-            except Exception:
+            except BaseException:
                 with contextlib.suppress(Exception):
                     await conn.rollback()
                 raise
