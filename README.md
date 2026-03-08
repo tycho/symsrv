@@ -90,7 +90,7 @@ server {
     # Optional: Use this if you have disk_cache.mode="nginx"
     location ^~ /_symsrv_cache/ {
         internal;
-        alias /srv/cache/ntsymbols/data/data/;
+        alias /srv/cache/ntsymbols/data/storage/data/;
         sendfile on;
         aio threads;
         tcp_nopush on;
