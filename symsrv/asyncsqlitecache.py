@@ -565,7 +565,7 @@ class AsyncSqliteCache:
     async def get_metadata(self, key: CacheKey) -> Optional[CacheMetadata]:
         """Retrieve metadata for a cached item if it exists and is not expired."""
         try:
-            async with self.connection_pool().transaction(write=False) as conn:
+            async with self.connection_pool().acquire() as conn:
                 rows = await conn.execute_fetchall(
                     """
                     SELECT url, status_code, created_at, accessed_at, ttl,
@@ -730,7 +730,7 @@ class AsyncSqliteCache:
     async def get_streaming(self, key: CacheKey) -> Optional[AsyncIterator[bytes]]:
         """Retrieve data from cache as an async stream."""
         try:
-            async with self.connection_pool().transaction(write=False) as conn:
+            async with self.connection_pool().acquire() as conn:
                 rows = await conn.execute_fetchall(
                     """
                     SELECT status_code, created_at, accessed_at, ttl
@@ -844,56 +844,58 @@ class AsyncSqliteCache:
                 "Found %d data files, checking for missing metadata...", len(data_files)
             )
 
-            for i in range(0, len(data_files), batch_size):
-                batch = data_files[i : i + batch_size]
-                remove_queue = []
-                key_data_pairs = []
+            async with self.connection_pool().acquire() as conn:
+                await conn.execute(
+                    """
+                    CREATE TEMP TABLE IF NOT EXISTS _to_check(
+                        key BLOB,
+                        path TEXT NOT NULL
+                    );
+                """
+                )
 
-                for data_path in batch:
-                    try:
-                        cache_key = cache_key_from_hexdigest(data_path.stem)
-                    except ValueError as e:
-                        logger.error("Invalid cache file %s: %s", data_path, e)
-                        remove_queue.append(data_path)
-                        continue
-                    lock = UDSSingleFlight(cache_key)
-                    if await lock.is_locked():
-                        continue
-                    key_data_pairs.append((cache_key.hash_key_raw, str(data_path)))
+                for i in range(0, len(data_files), batch_size):
+                    batch = data_files[i : i + batch_size]
+                    remove_queue = []
+                    key_data_pairs = []
 
-                async with self.connection_pool().transaction(write=False) as conn:
-                    await conn.execute(
+                    for data_path in batch:
+                        try:
+                            cache_key = cache_key_from_hexdigest(data_path.stem)
+                        except ValueError as e:
+                            logger.error("Invalid cache file %s: %s", data_path, e)
+                            remove_queue.append(data_path)
+                            continue
+                        lock = UDSSingleFlight(cache_key)
+                        if await lock.is_locked():
+                            continue
+                        key_data_pairs.append((cache_key.hash_key_raw, str(data_path)))
+
+                        await conn.execute("DELETE FROM _to_check;")
+                        await conn.executemany(
+                            "INSERT INTO _to_check(key, path) VALUES (?, ?)", key_data_pairs
+                        )
+                        sql = """
+                        SELECT t.path
+                        FROM _to_check as t
+                        LEFT JOIN cache_entries as c
+                            ON c.cache_key = t.key
+                        WHERE c.cache_key IS NULL
                         """
-                        CREATE TEMP TABLE IF NOT EXISTS _to_check(
-                            key BLOB,
-                            path TEXT NOT NULL
-                        );
-                    """
-                    )
-                    await conn.execute("DELETE FROM _to_check;")
-                    await conn.executemany(
-                        "INSERT INTO _to_check(key, path) VALUES (?, ?)", key_data_pairs
-                    )
-                    sql = """
-                    SELECT t.path
-                    FROM _to_check as t
-                    LEFT JOIN cache_entries as c
-                        ON c.cache_key = t.key
-                    WHERE c.cache_key IS NULL
-                    """
-                    rows = await conn.execute_fetchall(sql)
+                        rows = await conn.execute_fetchall(sql)
+                        await conn.commit()
 
-                if not rows:
-                    continue
+                    if not rows:
+                        continue
 
-                remove_queue.extend([Path(r[0]) for r in rows])
+                    remove_queue.extend([Path(r[0]) for r in rows])
 
-                if remove_queue:
-                    # Remove anything already deemed invalid
-                    await _remove_files(remove_queue)
-                    total_removed += len(remove_queue)
+                    if remove_queue:
+                        # Remove anything already deemed invalid
+                        await _remove_files(remove_queue)
+                        total_removed += len(remove_queue)
 
-                await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.05)
 
         except asyncio.CancelledError:
             raise
@@ -911,7 +913,7 @@ class AsyncSqliteCache:
         batch_size = 500
         try:
             bad_keys = []
-            async with self.connection_pool().transaction(write=False) as conn:
+            async with self.connection_pool().acquire() as conn:
                 sql = """
                 SELECT cache_key FROM cache_entries WHERE content_length > 0
                 """
