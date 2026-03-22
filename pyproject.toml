@@ -18,7 +18,7 @@ dependencies = [
 	"pyyaml (>=6.0.2,<7.0.0)",
 	"starlette (>=0.50.0,<0.53.0)",
 	"tomlkit (>=0.14.0,<0.15.0)",
-	"uvicorn (>=0.41.0,<0.42.0)",
+	"uvicorn (>=0.42.0,<0.43.0)",
 	"websockets (>=16.0,<17.0)",
 ]
 
@@ -36,7 +36,7 @@ build-backend = "poetry.core.masonry.api"
 
 [dependency-groups]
 dev = [
-    "black>=26.0.0",
+    "black>=26.3.1",
     "mypy>=1.19.1",
     "pyinstrument>=5.1.2",
     "pylint>=4.0.5",
