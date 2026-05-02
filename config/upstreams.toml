@@ -38,3 +38,8 @@ extensions = [".pdb", ".dll", ".exe"]
 name = "renderdoc"
 base_url = "https://renderdoc.org/symbols"
 extensions = [".pdb", ".dll", ".exe"]
+
+[[upstream]]
+name = "unity"
+base_url = "http://symbolserver.unity3d.com"
+extensions = [".pdb", ".dll", ".exe"]
