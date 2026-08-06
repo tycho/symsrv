@@ -7,7 +7,7 @@ workers = 4
 proxy_headers = true
 forwarded_allow_ips = "*"
 http = "httptools"
-ws = "websockets"
+ws = "websockets-sansio"
 log_config = "config/log_config.yml"
 
 [cache]
