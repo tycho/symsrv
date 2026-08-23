@@ -86,3 +86,9 @@ name = "ubuntu"
 layout = "debuginfod"
 binformat = ["elf"]
 base_url = "https://debuginfod.ubuntu.com"
+
+[[upstream]]
+name = "fedora"
+layout = "debuginfod"
+binformat = ["elf"]
+base_url = "https://debuginfod.fedoraproject.org"
