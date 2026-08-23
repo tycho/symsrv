@@ -92,3 +92,9 @@ name = "fedora"
 layout = "debuginfod"
 binformat = ["elf"]
 base_url = "https://debuginfod.fedoraproject.org"
+
+[[upstream]]
+name = "steamos"
+layout = "debuginfod"
+binformat = ["elf"]
+base_url = "https://debuginfod.steamos.cloud"
