@@ -1,45 +1,73 @@
+# Each upstream declares three orthogonal admission axes plus a URI layout:
+#
+#   layout     = "symstore"          # the URI scheme this server speaks
+#   binformat  = ["pe"]              # which families it hosts: pe / elf / macho
+#   provides   = ["image", "debug"]  # which roles it hosts: image / debug
+#   extensions = [".pdb", ".dll"]    # optional finer symstore-only narrowing
+#
+# A request is sent to an upstream only if ALL declared axes admit it. Defaults:
+# layout="symstore", binformat=["pe"], provides=["image","debug"], no extensions.
+# Use `provides` for a clean image/debug split, `extensions` for finer control
+# (e.g. dropping .sys), and neither when a server hosts everything.
+
 [[upstream]]
 name = "microsoft"
+layout = "symstore"
+binformat = ["pe"]
 base_url = "http://msdl.microsoft.com/download/symbols"
-extensions = [".pdb", ".dll", ".exe", ".sys", ".snupkg"]
 
 [[upstream]]
 name = "nuget"
+layout = "symstore"
+binformat = ["pe"]
 base_url = "https://symbols.nuget.org/download/symbols"
-extensions = [".pdb", ".dll", ".exe", ".sys", ".snupkg"]
 requires_symbolchecksum = true
 
 [[upstream]]
 name = "nvidia"
+layout = "symstore"
+binformat = ["pe"]
+provides = ["image"]
 base_url = "https://driver-symbols.nvidia.com"
-extensions = [".dll", ".exe", ".sys"]
 
 [[upstream]]
 name = "amd"
+layout = "symstore"
+binformat = ["pe"]
+provides = ["image"]
 base_url = "https://download.amd.com/dir/bin"
-extensions = [".dll", ".exe", ".sys"]
 
 [[upstream]]
 name = "intel"
+layout = "symstore"
+binformat = ["pe"]
+provides = ["image"]
 base_url = "https://software.intel.com/sites/downloads/symbols"
-extensions = [".dll", ".exe", ".sys"]
 
 [[upstream]]
 name = "mozilla"
-base_url = "https://symbols.mozilla.org"
+layout = "symstore"
+binformat = ["pe"]
 extensions = [".pdb", ".dll", ".exe"]
+base_url = "https://symbols.mozilla.org"
 
 [[upstream]]
 name = "chrome"
-base_url = "https://chromium-browser-symsrv.commondatastorage.googleapis.com"
+layout = "symstore"
+binformat = ["pe"]
 extensions = [".pdb", ".dll", ".exe"]
+base_url = "https://chromium-browser-symsrv.commondatastorage.googleapis.com"
 
 [[upstream]]
 name = "renderdoc"
-base_url = "https://renderdoc.org/symbols"
+layout = "symstore"
+binformat = ["pe"]
 extensions = [".pdb", ".dll", ".exe"]
+base_url = "https://renderdoc.org/symbols"
 
 [[upstream]]
 name = "unity"
-base_url = "http://symbolserver.unity3d.com"
+layout = "symstore"
+binformat = ["pe"]
 extensions = [".pdb", ".dll", ".exe"]
+base_url = "http://symbolserver.unity3d.com"
