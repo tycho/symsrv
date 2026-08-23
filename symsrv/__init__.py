@@ -19,6 +19,7 @@ from .asyncsqlitecache import AsyncSqliteCache
 from .singleflight import SingleFlight, UDSSingleFlight, NoOpSingleFlight
 from .log_queue import install_queue_logging, shutdown_queue_logging
 from .config import AppConfig
+from .health import UpstreamHealth
 from .layout import classify_request
 from .upstream import Upstream
 
@@ -339,6 +340,16 @@ async def startup_event():
     else:
         raise ValueError(f"Unknown cache backend type: {config.cache_backend_type}")
 
+    # Upstream circuit breaker (shared across workers via an mmap'd file).
+    health_state_path = os.path.join(config.cache_path, "upstream_health.mmap")
+    app.state.health = await UpstreamHealth(
+        app.state.session,
+        config.upstreams,
+        health_state_path,
+        probe_interval=config.health_probe_interval,
+        probe_timeout=config.health_probe_timeout,
+    ).start()
+
     app.state.task_manager = BackgroundTaskManager()
     await app.state.task_manager.start()
 
@@ -348,6 +359,8 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     await app.state.task_manager.stop()
+    # Stop the health probe before closing the session it uses.
+    await app.state.health.stop()
     await app.state.session.close()
     await app.state.cache.close()
     shutdown_queue_logging()
@@ -423,6 +436,7 @@ async def _attempt_upstream(
     assert key.full_url is not None
 
     config: AppConfig = request.app.state.config
+    health = request.app.state.health
 
     single = UDSSingleFlight(key) if allow_cache else NoOpSingleFlight(key)
 
@@ -441,13 +455,33 @@ async def _attempt_upstream(
                 await single.release()
                 return hit
 
+        # The upstream may have been suspended while we waited on the lock (e.g.
+        # a sibling request just tripped it). Bail out rather than pile onto a
+        # known-bad upstream. This is a cheap flag check, not a liveness probe.
+        if not health.is_available(upstream.name):
+            return None
+
         logger.debug("Cache miss for %s", key.full_url)
 
-        # Upstream fetch
+        # Upstream fetch. An exception here means we never completed a
+        # request/response cycle (connect/read timeout, refused, reset, ...),
+        # so suspend the upstream. A complete HTTP response -- including 5xx --
+        # returns normally and never trips the breaker.
         req_headers = upstream.passthrough_headers(request)
-        resp: Optional[aiohttp.ClientResponse] = None
         try:
             resp = await session.request(method, key.full_url, headers=req_headers)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            health.trip(upstream.name)
+            logger.warning(
+                "Upstream request to %s failed at the transport level: %s",
+                key.full_url,
+                e,
+            )
+            return None
+
+        try:
             status = resp.status
             etag = resp.headers.get("ETag")
             last_mod = resp.headers.get("Last-Modified", _httpdate_now_gmt())
@@ -492,7 +526,9 @@ async def _attempt_upstream(
             raise
         except Exception as e:
             await _close_response(resp)
-            logger.exception("Upstream request to %s failed: %s", key.full_url, e)
+            logger.exception(
+                "Error handling upstream response from %s: %s", key.full_url, e
+            )
             return None
 
 
@@ -579,6 +615,7 @@ async def proxy(path: str, request: Request):
 
     session: aiohttp.ClientSession = request.app.state.session
     cache = request.app.state.cache
+    health = request.app.state.health
 
     # Build the set of upstreams that can serve this query, each with the
     # canonical URL + cache key it would use.
@@ -627,9 +664,20 @@ async def proxy(path: str, request: Request):
             negative_keys.add(meta.key.hash_key_raw)
 
     # Remaining = cachable upstreams without a decisive cache hit, plus the
-    # uncachable ones (which we always query live).
-    remaining = [c for c in cachable if c.key.hash_key_raw not in negative_keys]
-    remaining += [c for c in candidates if not c.upstream.cachable]
+    # uncachable ones (which we always query live). Suspended upstreams are
+    # dropped from the live fan-out here (a cheap flag check, no liveness probe)
+    # -- but note they still served cache hits in the loop above.
+    remaining = [
+        c
+        for c in cachable
+        if c.key.hash_key_raw not in negative_keys
+        and health.is_available(c.upstream.name)
+    ]
+    remaining += [
+        c
+        for c in candidates
+        if not c.upstream.cachable and health.is_available(c.upstream.name)
+    ]
 
     if remaining:
         logger.debug(

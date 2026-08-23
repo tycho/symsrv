@@ -32,6 +32,8 @@ class AppConfig:
     cache_mode: str
     cache_path: str
     cache_ttl: dict[int, int]
+    health_probe_interval: float
+    health_probe_timeout: float
     # Raw main.toml, for sections consumed verbatim elsewhere (sqlite, uvicorn).
     main: dict
 
@@ -66,6 +68,8 @@ class AppConfig:
         for spec in main_cfg["log_filters"]["ignore_access"]:
             ignore_access.add((int(spec["status"]), str(spec["path"])))
 
+        health_cfg = main_cfg.get("health", {})
+
         return cls(
             upstreams=upstreams,
             substring_blacklist=bl_cfg["substring_blacklist"].get("names", []),
@@ -78,5 +82,7 @@ class AppConfig:
             cache_mode=cache_cfg.get("mode", "standalone"),
             cache_path=cache_path,
             cache_ttl=cache_ttl,
+            health_probe_interval=float(health_cfg.get("probe_interval", 30)),
+            health_probe_timeout=float(health_cfg.get("probe_timeout", 15)),
             main=main_cfg,
         )

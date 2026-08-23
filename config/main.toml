@@ -44,3 +44,13 @@ ignore_access = [
 200 = 31536000 # 365 days
 403 = 1209600  # 14 days
 404 = 604800   # 7 days
+
+# Upstream circuit breaker. An upstream that fails to complete a request/response
+# cycle (connect/read timeout, connection refused, reset) is suspended and
+# dropped from the live fan-out. A background task probes suspended upstreams
+# every probe_interval seconds with a HEAD to their base URL; any complete
+# response (any status) restores them. Suspended upstreams are never probed in
+# the request hot path. State is shared across workers via an mmap'd file.
+[health]
+probe_interval = 30
+probe_timeout = 15
