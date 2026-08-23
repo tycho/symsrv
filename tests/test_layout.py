@@ -46,9 +46,13 @@ _upstream = _load("upstream")
 Family = _layout.Family
 Role = _layout.Role
 SymStoreLayout = _layout.SymStoreLayout
+DebuginfodLayout = _layout.DebuginfodLayout
 SymbolQuery = _layout.SymbolQuery
 classify_request = _layout.classify_request
 Upstream = _upstream.Upstream
+
+# The Sentry example from the design discussion (full 20-byte GNU build-id).
+BUILDID = "02c41f76020d316b3780a1e248a37309cae8d0dc"
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +248,171 @@ def test_from_config_rejects_unknown_layout():
     except ValueError:
         return
     raise AssertionError("expected ValueError for unknown layout")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: ELF/Mach-O SSQP decoding (symstore inbound)
+# ---------------------------------------------------------------------------
+
+
+def test_ssqp_elf_debug():
+    # Sentry's synthesized ELF debug request.
+    q = classify_request(f"/_.debug/elf-buildid-sym-{BUILDID}/_.debug")
+    assert q is not None
+    assert q.family is Family.ELF
+    assert q.role is Role.DEBUG
+    assert q.ident == BUILDID
+    assert q.inbound_layout == "symstore"
+
+
+def test_ssqp_elf_image():
+    # Sentry's synthesized ELF executable request.
+    name = "libpulsecommon-17.0.so"
+    q = classify_request(f"/{name}/elf-buildid-{BUILDID}/{name}")
+    assert q is not None
+    assert q.family is Family.ELF
+    assert q.role is Role.IMAGE
+    assert q.ident == BUILDID
+
+
+def test_ssqp_ident_is_lowercased():
+    q = classify_request(f"/_.debug/elf-buildid-sym-{BUILDID.upper()}/_.debug")
+    assert q is not None
+    assert q.ident == BUILDID  # normalized to lowercase
+
+
+def test_ssqp_macho():
+    uuid = "1234567890abcdef1234567890abcdef"
+    qd = classify_request(f"/foo.dylib/mach-uuid-sym-{uuid}/foo.dylib")
+    assert qd is not None and qd.family is Family.MACHO and qd.role is Role.DEBUG
+    assert qd.ident == uuid
+    qi = classify_request(f"/foo.dylib/mach-uuid-{uuid}/foo.dylib")
+    assert qi is not None and qi.family is Family.MACHO and qi.role is Role.IMAGE
+
+
+def test_ssqp_malformed_rejected():
+    # Marked ELF but the id isn't hex -> reject (no fallback to PE).
+    assert classify_request("/_.debug/elf-buildid-sym-nothex!!/_.debug") is None
+
+
+def test_lossy_guid_form_rejected():
+    # SymStore GUID form (only 16 build-id bytes, byte-swapped) -> not
+    # translatable -> 404.
+    name = "libpulsecommon-17.0.so"
+    guid = "761FC4020D026B313780A1E248A373090"
+    assert classify_request(f"/{name}/{guid}/{name}") is None
+
+
+def test_lossy_compressed_form_rejected():
+    name = "libpulsecommon-17.0.so"
+    guid = "761FC4020D026B313780A1E248A373090"
+    assert classify_request(f"/{name}/{guid}/libpulsecommon-17.0.s_") is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: debuginfod layout (inbound + render)
+# ---------------------------------------------------------------------------
+
+
+def test_debuginfod_classify_artifacts():
+    qd = classify_request(f"/buildid/{BUILDID}/debuginfo")
+    assert qd is not None and qd.family is Family.ELF and qd.role is Role.DEBUG
+    assert qd.ident == BUILDID and qd.inbound_layout == "debuginfod"
+
+    qe = classify_request(f"/buildid/{BUILDID}/executable")
+    assert qe is not None and qe.role is Role.IMAGE
+
+
+def test_debuginfod_classify_source_keeps_absolute_path():
+    q = classify_request(f"/buildid/{BUILDID}/source//usr/src/debug/foo.c")
+    assert q is not None
+    assert q.role is Role.SOURCE
+    assert q.source_path == "/usr/src/debug/foo.c"
+
+
+def test_debuginfod_classify_rejects_junk():
+    assert classify_request(f"/buildid/{BUILDID}/bogus") is None
+    assert classify_request("/buildid/nothex/debuginfo") is None
+    assert classify_request(f"/buildid/{BUILDID}/debuginfo/extra") is None
+    assert classify_request(f"/buildid/{BUILDID}/source/") is None
+    assert classify_request(f"/buildid/{BUILDID}") is None
+
+
+def test_debuginfod_render_canonical():
+    layout = DebuginfodLayout()
+    base = "https://debuginfod.archlinux.org"
+    qd = classify_request(f"/buildid/{BUILDID}/debuginfo")
+    qe = classify_request(f"/buildid/{BUILDID}/executable")
+    qs = classify_request(f"/buildid/{BUILDID}/source//usr/x.c")
+    assert layout.render(base, qd) == f"{base}/buildid/{BUILDID}/debuginfo"
+    assert layout.render(base, qe) == f"{base}/buildid/{BUILDID}/executable"
+    assert layout.render(base, qs) == f"{base}/buildid/{BUILDID}/source//usr/x.c"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: cross-layout translation + routing
+# ---------------------------------------------------------------------------
+
+
+def _debuginfod_upstream(**kw):
+    cfg = {
+        "name": "arch",
+        "base_url": "https://debuginfod.archlinux.org",
+        "layout": "debuginfod",
+        "binformat": ["elf"],
+    }
+    cfg.update(kw)
+    return Upstream.from_config(cfg)
+
+
+def test_cross_layout_cache_unification():
+    # A SymbolStore-ELF request and a native debuginfod request for the same
+    # build-id must produce the SAME upstream URL (hence the same cache key).
+    up = _debuginfod_upstream()
+
+    symstore_debug = classify_request(f"/_.debug/elf-buildid-sym-{BUILDID}/_.debug")
+    native_debug = classify_request(f"/buildid/{BUILDID}/debuginfo")
+    assert up.candidate_url(symstore_debug) == up.candidate_url(native_debug)
+    assert up.candidate_url(native_debug) == (
+        f"https://debuginfod.archlinux.org/buildid/{BUILDID}/debuginfo"
+    )
+
+    name = "libpulsecommon-17.0.so"
+    symstore_img = classify_request(f"/{name}/elf-buildid-{BUILDID}/{name}")
+    native_img = classify_request(f"/buildid/{BUILDID}/executable")
+    assert up.candidate_url(symstore_img) == up.candidate_url(native_img)
+
+
+def test_elf_routes_to_debuginfod_not_symstore_pe():
+    q = classify_request(f"/_.debug/elf-buildid-sym-{BUILDID}/_.debug")
+    debuginfod = _debuginfod_upstream()
+    pe = Upstream.from_config({"name": "microsoft", "base_url": "https://msdl"})
+    assert debuginfod.candidate_url(q) is not None
+    assert pe.candidate_url(q) is None
+
+
+def test_pe_never_routes_to_debuginfod():
+    q = classify_request("/foo.pdb/HASH/foo.pdb")
+    assert _debuginfod_upstream().candidate_url(q) is None
+
+
+def test_macho_has_no_renderer_yet():
+    uuid = "1234567890abcdef1234567890abcdef"
+    q = classify_request(f"/foo.dylib/mach-uuid-sym-{uuid}/foo.dylib")
+    # No debuginfod (ELF-only) or PE upstream can serve Mach-O -> no candidate.
+    assert _debuginfod_upstream().candidate_url(q) is None
+    pe = Upstream.from_config({"name": "microsoft", "base_url": "https://msdl"})
+    assert pe.candidate_url(q) is None
+
+
+def test_source_role_bypasses_provides_narrowing():
+    # A debuginfod upstream that only declares debug should still be offered
+    # source requests (provides is the image/debug split, not a source gate).
+    up = _debuginfod_upstream(provides=["debug"])
+    q = classify_request(f"/buildid/{BUILDID}/source//usr/x.c")
+    assert up.candidate_url(q) is not None
+    # ...but image is correctly narrowed out.
+    assert up.candidate_url(classify_request(f"/buildid/{BUILDID}/executable")) is None
 
 
 # ---------------------------------------------------------------------------

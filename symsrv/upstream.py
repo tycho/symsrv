@@ -89,7 +89,9 @@ class Upstream:
         """Whether this upstream could plausibly hold the requested artifact."""
         if query.family not in self.binformat:
             return False
-        if query.role is not None and query.role not in self.provides:
+        # `provides` is the image/debug split; it doesn't narrow other roles
+        # (SOURCE, or the None "any" role of symstore index files).
+        if query.role in (Role.IMAGE, Role.DEBUG) and query.role not in self.provides:
             return False
         if self.extensions is not None and query.ext is not None:
             if query.ext not in self.extensions:
