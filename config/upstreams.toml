@@ -71,3 +71,18 @@ layout = "symstore"
 binformat = ["pe"]
 extensions = [".pdb", ".dll", ".exe"]
 base_url = "http://symbolserver.unity3d.com"
+
+# debuginfod upstreams (ELF). SymbolStore-layout ELF requests that carry a full
+# GNU build-id (elf-buildid[-sym]-<hex>) are translated into buildid/<id>/...
+# queries against these; native /buildid/<id>/... requests pass through too.
+[[upstream]]
+name = "archlinux"
+layout = "debuginfod"
+binformat = ["elf"]
+base_url = "https://debuginfod.archlinux.org"
+
+[[upstream]]
+name = "ubuntu"
+layout = "debuginfod"
+binformat = ["elf"]
+base_url = "https://debuginfod.ubuntu.com"

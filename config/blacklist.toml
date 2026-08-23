@@ -1,9 +1,9 @@
 # Rejects any URL with a matching substring from this list
 [substring_blacklist]
 names = [
-	# Sentry requests these, even though this is a Windows symbol server
-	"elf-buildid-sym-",
-	"mach-uuid-sym-",
+	# NOTE: "elf-buildid-sym-" and "mach-uuid-sym-" used to be rejected here
+	# because this was Windows-only. They are now decoded and (for ELF)
+	# translated into debuginfod queries, so they must NOT be blacklisted.
 ]
 
 # Rejects any URL where the first path component (i.e. '/foo/bar' would check
@@ -606,7 +606,9 @@ names = [
 [suffix_blacklist]
 names = [
 	".src.zip",
-	".debug",
+	# NOTE: ".debug" was rejected here (ELF separate-debug files). ELF debug is
+	# now translated to debuginfod, so it must not be blacklisted. ".dbg"/".db_"
+	# remain: they are PE .dbg companions no configured upstream serves.
 	".dbg",
 	".db_",
 ]
