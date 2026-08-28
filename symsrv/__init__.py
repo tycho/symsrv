@@ -596,6 +596,10 @@ async def proxy(path: str, request: Request):
     # Normalize path to exactly one leading '/'
     path = "/" + path.lstrip("/")
 
+    # Commonly used as a server health check (e.g. by Ghidra)
+    if path == "/pingme.txt":
+        return Response(status_code=200)
+
     config: AppConfig = request.app.state.config
 
     if is_blacklisted_path(path, config):
